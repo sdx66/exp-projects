@@ -15,6 +15,9 @@ raylib 6.x 使用 cffi 绑定，结构体通过 tuple 直接传入（不解包�
   ✗ rl.DrawRectangle(x, y, w, h, *color(255,0,0))
 """
 
+import os
+import platform
+
 import raylib as rl
 
 
@@ -76,24 +79,115 @@ def camera3d(px=0.0, py=0.0, pz=0.0,
     return ((px, py, pz), (tx, ty, tz), (ux, uy, uz), fovy, proj)
 
 
+# ─── CJK 字体 ─────────────────────────────────────────────
+# raylib 默认字体只含 ASCII 字形,中文会渲染成 '?'。这里加载一个含 CJK 的
+# TTF,并把实际用到的码点显式传给 LoadFontEx(传 NULL 只会加载 ASCII 字形)。
+# 优先用项目内捆绑的 assets/cn_font.ttf(Noto Sans SC 子集,OFL);找不到时
+# 回退到各系统 CJK 字体;都没有则用默认字体(中文仍会变 '?' 但不崩)。
+
+_FONT = None
+_FONT_BASE_SIZE = 64  # 字形栅格基准;运行时按 font_size 缩放,10~40px 都清晰
+_FILTER_BILINEAR = getattr(rl, "TEXTURE_FILTER_BILINEAR", 1)  # raylib 6.x
+
+try:
+    from _cn_codepoints import CODEPOINTS as _CODEPOINTS
+except Exception:  # 子集码点表缺失时退化为仅 ASCII
+    _CODEPOINTS = list(range(32, 127))
+
+
+def _candidate_font_paths():
+    here = os.path.dirname(os.path.abspath(__file__))
+    yield os.path.join(here, "assets", "cn_font.ttf")  # 捆绑字体(优先)
+    sys_name = platform.system()
+    if sys_name == "Windows":
+        # raylib 6.x 的 LoadFontEx 不支持 .ttc(msyh.ttc/simsun.ttc 会静默退回
+        # 默认字体),故优先单 .ttf 的中文字体;.ttc 留作兜底,下方 _font_has_cjk
+        # 会校验并跳过无效结果。
+        for n in ("simhei.ttf", "Deng.ttf", "msyh.ttc", "simsun.ttc"):
+            yield os.path.join(r"C:\Windows\Fonts", n)
+    elif sys_name == "Darwin":
+        yield "/Library/Fonts/Arial Unicode.ttf"  # 单 TTF,装了 Office 才有
+        for n in ("PingFang.ttc", "STHeiti Medium.ttc", "Hiragino Sans GB.ttc"):
+            yield "/System/Library/Fonts/" + n
+    else:  # Linux:多为 .ttc/.otf,raylib 多半不支持,仅作尝试
+        for n in (
+            "/usr/share/fonts/truetype/noto/NotoSansCJK-Regular.ttc",
+            "/usr/share/fonts/wqy-microhei/wqy-microhei.ttc",
+            "/usr/share/fonts/wenquanyi/wqy-microhei/wqy-microhei.ttc",
+        ):
+            yield n
+
+
+# 用两个不同的常用汉字探测字体是否真含 CJK 字形。raylib 6.x 的 LoadFontEx
+# 不支持 .ttc,会把 .ttc 静默退回默认字体(只含 ASCII),此时 GetGlyphIndex
+# 对任意中文都返回同一个 notdef 索引 —— 据此判定无效并跳到下一个候选。
+_CJK_PROBE = (0x4E2D, 0x4E00)  # '中', '一'
+
+
+def _font_has_cjk(font) -> bool:
+    try:
+        a = rl.GetGlyphIndex(font, _CJK_PROBE[0])
+        b = rl.GetGlyphIndex(font, _CJK_PROBE[1])
+        return a >= 0 and b >= 0 and a != b
+    except Exception:
+        return False
+
+
+def _get_font():
+    global _FONT
+    if _FONT is not None:
+        return _FONT
+    # cffi int 数组,供 LoadFontEx 的 int *codepoints 参数使用
+    cps = rl.ffi.new("int[]", _CODEPOINTS) if _CODEPOINTS else None
+    for path in _candidate_font_paths():
+        if not path or not os.path.isfile(path):
+            continue
+        try:
+            font = rl.LoadFontEx(path.encode("utf-8"), _FONT_BASE_SIZE,
+                                 cps, len(_CODEPOINTS))
+        except Exception:
+            continue
+        if not _font_has_cjk(font):
+            # .ttc 退回默认字体 / 不含中文 -> 跳过(不 UnloadFont,以免误释放
+            # 共享的默认字体),继续尝试下一个候选
+            continue
+        try:
+            rl.SetTextureFilter(font.texture, _FILTER_BILINEAR)
+        except Exception:
+            pass
+        _FONT = font
+        return _FONT
+    _FONT = rl.GetFontDefault()
+    return _FONT
+
+
 # ─── 文本绘制 ──────────────────────────────────────────────
 
 def draw_text(text: str, x: int, y: int, font_size: int = 10, c=None):
     if c is None:
         c = (255, 255, 255, 255)
-    rl.DrawText(text.encode("utf-8"), x, y, font_size, c)
+    spacing = font_size / 10.0  # 与 raylib DrawText/MeasureText 默认间距一致
+    rl.DrawTextEx(_get_font(), text.encode("utf-8"),
+                  (float(x), float(y)), float(font_size), spacing, c)
 
 
 def draw_text_centered(text: str, y: int, font_size: int = 10, c=None):
     if c is None:
         c = (255, 255, 255, 255)
-    w = rl.MeasureText(text.encode("utf-8"), font_size)
+    w = measure_text(text, font_size)
     x = (rl.GetScreenWidth() - w) // 2
     draw_text(text, x, y, font_size, c)
 
 
 def measure_text(text: str, font_size: int = 10) -> int:
-    return rl.MeasureText(text.encode("utf-8"), font_size)
+    spacing = font_size / 10.0
+    res = rl.MeasureTextEx(_get_font(), text.encode("utf-8"),
+                           float(font_size), spacing)
+    try:
+        w = res.x          # cffi 返回 struct Vector2
+    except AttributeError:
+        w = res[0]         # 兼容绑定以元组返回的情况
+    return int(w)
 
 
 def set_text_color(c):

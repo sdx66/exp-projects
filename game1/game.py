@@ -530,7 +530,7 @@ class Game:
             if tt.requires_tech:
                 missing = [t for t in tt.requires_tech if t not in self.unlocked_tech]
                 if missing:
-                    parts.append(f"[{key}]{label}🔒")
+                    parts.append(f"[{key}]{label} (lock)")
                     continue
             parts.append(f"[{key}]{label}")
         draw_text(" ".join(parts), 10, bar_y + 8, 12, color(180, 180, 200))
