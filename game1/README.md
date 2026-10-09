@@ -18,5 +18,7 @@ Then run:
 python main.py
 ```
 Other versions of these packages may work, but they are not tested.
+Fonts
+If you want to customize or need help with Chinese font rendering, please see FONTS.md.
 ## Note
 This is a very early version, so it is quite simple and may be boring.
