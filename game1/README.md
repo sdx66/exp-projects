@@ -22,5 +22,7 @@ Then run the game in one of two ways:
     python main.py 42
     ```
 Other versions of these packages may work, but they are not tested.
+Fonts
+If you want to customize or need help with Chinese font rendering, please see FONTS.md.
 ## Note
 This is a very early version, so it is quite simple and may be boring.
