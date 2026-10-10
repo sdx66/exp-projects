@@ -17,23 +17,23 @@ class Camera:
     2D 模式：正交俯视图（position, zoom）
     """
 
-    def __init__(self, world_size: int, universe=None):
+    def __init__(self, universe=None):
         self.mode = "3d"
-        self.world_size = world_size
         self.universe = universe
 
         # 3D 相机参数
-        # 看向路径起点附近，让玩家能看到敌人走来
-        tx = world_size / 2
-        tz = world_size / 2
-        # Y 对准地形表面（而非硬编码值），避免看向地下
+        # 看向大本营位置（世界原点）
+        tx = 0
+        tz = 0
         if universe:
+            tx = universe.base_x
+            tz = universe.base_z
             tx_i, tz_i = int(tx), int(tz)
             ty = universe.get_surface_height(tx_i, tz_i) + 1
         else:
-            ty = 8  # 默认回退值
+            ty = 8
         self.target = vec3(tx, ty, tz)
-        self.distance = 28.0
+        self.distance = 42.0
         self.altitude = 0.5   # ~29° 侧面视角，地形更立体
         self.azimuth = 0.6   # 从前方偏侧观察
         self.distance_target = self.distance
@@ -41,7 +41,7 @@ class Camera:
         self.azimuth_target = self.azimuth
 
         # 2D 相机参数
-        self.pos_2d = vec3(world_size / 2, 0, world_size / 2)
+        self.pos_2d = vec3(0, 0, 0)  # 大本营位置
         self.zoom_2d = 1.0
         self.zoom_2d_target = 1.0
 
@@ -129,12 +129,8 @@ class Camera:
                            self.target[1],
                            self.target[2] + fx * pan_speed)
 
-        margin = 5.0
-        self.target = (
-            max(margin, min(self.world_size - margin, self.target[0])),
-            self.target[1],
-            max(margin, min(self.world_size - margin, self.target[2]))
-        )
+        # 无限地形：不再限制相机移动范围
+        # （移除旧的 margin 限制）
 
         scroll = rl.GetMouseWheelMove()
         if scroll != 0:
@@ -176,12 +172,7 @@ class Camera:
         if rl.IsKeyDown(rl.KEY_D) or rl.IsKeyDown(rl.KEY_RIGHT):
             self.pos_2d = (self.pos_2d[0] - pan_speed, self.pos_2d[1], self.pos_2d[2])
 
-        margin = 2.0
-        self.pos_2d = (
-            max(margin, min(self.world_size - margin, self.pos_2d[0])),
-            self.pos_2d[1],
-            max(margin, min(self.world_size - margin, self.pos_2d[2]))
-        )
+        # 无限地形：不再限制 2D 相机移动范围
 
         scroll = rl.GetMouseWheelMove()
         if scroll != 0:
@@ -196,7 +187,7 @@ class Camera:
             self.pos_2d = (self.target[0], 0, self.target[2])
         else:
             self.mode = "3d"
-            self.target = (self.pos_2d[0], 0, self.pos_2d[2])
+            self.target = (self.pos_2d[0], self.target[1], self.pos_2d[2])
 
     def is_3d(self) -> bool:
         return self.mode == "3d"
@@ -223,14 +214,11 @@ class Camera:
                 rz = oz + dz * t
 
                 xi, zi = int(rx), int(rz)
-                if 0 <= xi < self.world_size and 0 <= zi < self.world_size:
-                    terrain_top = self.universe.get_surface_height_smooth(rx, rz) + 1.0
-                    if ry < terrain_top:
-                        # 射线进入地形，返回交点
-                        return rx, terrain_top, rz
-                elif i > 0:
-                    # 超出世界范围，用射线与 Y=target_y 平面求交回退
-                    break
+                # 无限地形：不再检查世界边界
+                terrain_top = self.universe.get_surface_height_smooth_safe(rx, rz) + 1.0
+                if ry < terrain_top:
+                    # 射线进入地形，返回交点
+                    return rx, terrain_top, rz
 
             # 回退：用射线与 Y=target_y 平面求交
             ground_y = self.target[1]

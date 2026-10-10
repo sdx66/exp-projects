@@ -4,10 +4,18 @@ game.py - 主游戏循环与状态机
 """
 
 import raylib as rl
+import math
 import config
-from entities import Tower, Enemy, Projectile, TOWER_TYPES, ENEMY_TYPES
-from physics import distance_2d, clamp
+from entities import Tower, Enemy, Pickup, Base, TOWER_TYPES, ENEMY_TYPES
+from items import (
+    Inventory, MATERIAL_NAMES_CN,
+    WEAPON_TYPES, TOOL_TYPES, PROCESS_RECIPES,
+    can_process, process, can_craft_weapon, craft_weapon,
+    can_craft_tool, craft_tool, dismantle_refund,
+    CLASSIC_TOWER_MATERIALS, DISMANTLE_REFUND,
+)
 from rl_utils import *
+from ui_renderer import UIRenderer
 
 
 class GameState:
@@ -26,18 +34,27 @@ class Game:
         self.universe = universe
         self.camera = camera
         self.renderer = renderer
+        self.ui = UIRenderer()
 
         # 游戏状态
         self.state = GameState.PLAYING
         self.money = config.STARTING_MONEY
-        self.lives = config.STARTING_LIVES
         self.wave = 0
         self.score = 0
+
+        # 大本营
+        base_y = universe.get_surface_height(universe.base_x, universe.base_z)
+        self.base = Base((universe.base_x + 0.5, base_y + 1, universe.base_z + 0.5),
+                         max_health=config.BASE_HEALTH)
 
         # 实体
         self.towers = []
         self.enemies = []
         self.projectiles = []
+        self.pickups = []  # 地面掉落物
+        # 从宇宙加载预设宝箱
+        if hasattr(universe, "loot_pickups"):
+            self.pickups.extend(universe.loot_pickups)
 
         # 波次管理
         self.wave_timer = 0.0
@@ -59,11 +76,6 @@ class Game:
         self.toast_message = None
         self.toast_timer = 0.0
 
-        # 输入
-        self.keys = {}
-        self.mouse_x = 0
-        self.mouse_y = 0
-
         # 计时
         self.game_time = 0.0
         self.fps = 0
@@ -75,6 +87,14 @@ class Game:
         self.tech_researching = None
         self.tech_research_timer = 0.0
         self.tech_research_total = 0.0
+
+        # 材料/背包/交互
+        self.inventory = Inventory()
+        self.interaction_mode = "none"  # "none"|"place_classic"|"place_weapon"|"dismantle"
+        self.selected_weapon = None
+        self.craft_panel_open = False
+        self.craft_timer = 0.0
+        self.craft_action = None  # 当前加工/合成动作
 
         # 初始化
         self._init_wave(1)
@@ -104,12 +124,18 @@ class Game:
         """重启游戏 — 重置所有状态"""
         self.state = GameState.PLAYING
         self.money = config.STARTING_MONEY
-        self.lives = config.STARTING_LIVES
         self.wave = 0
         self.score = 0
+        # 重置大本营
+        self.base.health = self.base.max_health
+        self.base.active = True
+        self.base.damage_flash = 0.0
         self.towers = []
         self.enemies = []
         self.projectiles = []
+        self.pickups = []
+        if hasattr(self.universe, "loot_pickups"):
+            self.pickups.extend(self.universe.loot_pickups)
         self.wave_timer = 0.0
         self.wave_delay = 3.0
         self.wave_spawn_timer = 0.0
@@ -130,6 +156,12 @@ class Game:
         self.tech_researching = None
         self.tech_research_timer = 0.0
         self._init_wave(1)
+        self.inventory.reset()
+        self.interaction_mode = "none"
+        self.selected_weapon = None
+        self.craft_panel_open = False
+        self.craft_timer = 0.0
+        self.craft_action = None
 
     def _spawn_enemy(self):
         """生成敌人 — 根据性格和拥挤度选择路径"""
@@ -144,16 +176,15 @@ class Game:
             return
 
         # 选择路径：根据敌人性格、地形偏好、拥挤程度
-        all_paths = self.universe.enemy_paths if self.universe.enemy_paths else [self.universe.enemy_path]
+        all_paths = self.universe.enemy_paths
+        if not all_paths:
+            return
+
+        # 选择路径：根据敌人性格、地形偏好、拥挤程度
         chosen_path = Enemy.pick_path(enemy_type, all_paths, existing_enemies=self.enemies, rng=self.universe.rng)
 
         # 位置：所选路径的起点
-        if chosen_path is not None:
-            start = chosen_path.points[0]
-        elif self.universe.enemy_path:
-            start = self.universe.enemy_path[0]
-        else:
-            start = (0, 0, 0)
+        start = chosen_path.points[0] if chosen_path else all_paths[0].points[0]
 
         # 波次增强（指数增长；原来的加法 1+G*(w-1) 使波10 就达 11 倍，曲线失真）
         health_mult = config.ENEMY_HEALTH_GROWTH ** (self.wave - 1)
@@ -220,9 +251,29 @@ class Game:
         return True
 
     def _award_kill(self, enemy):
-        """击杀结算：金钱 + 分数"""
+        """击杀结算：金钱 + 分数 + 掉落物"""
         self.money += enemy.reward
         self.score += enemy.reward * 2
+
+        # 掉落物：根据敌人类型决定
+        drop_table = {
+            "regular": [("wood", 2), ("stone", 2)],
+            "fast": [("sand", 1), ("wood", 1)],
+            "tank": [("iron_ore", 1), ("stone", 3)],
+        }
+        drops = drop_table.get(enemy.type_name, [("wood", 1)])
+        drop = self.universe.rng.choice(drops)
+        # 同类型越强越多：波次越高(同类型血量随 1.08^(wave-1) 成长)掉落越多；
+        # 加成只看波次、对所有类型同等，保持各类型原始掉落比例不变。
+        amount = max(1, drop[1] + self.wave // 10)
+        pickup = Pickup(
+            position=(enemy.position[0], enemy.position[1] + 0.3, enemy.position[2]),
+            item_type="material",
+            item_name=drop[0],
+            amount=amount,
+            rng=self.universe.rng,
+        )
+        self.pickups.append(pickup)
 
     def update(self, dt):
         """更新游戏逻辑"""
@@ -249,7 +300,7 @@ class Game:
         self.camera.update(dt)
 
         # 更新天气
-        self.universe.update_weather()
+        self.universe.update_weather(dt)
 
     def _update_playing(self, dt):
         """更新游戏进行中状态"""
@@ -287,9 +338,9 @@ class Game:
         # 更新敌人
         for enemy in self.enemies:
             result = enemy.update(dt, self.universe)
-            if result == "reached":
-                self.lives -= 1
-                if self.lives <= 0:
+            if result == "reached_base":
+                killed = self.base.take_damage(config.ENEMY_BASE_DAMAGE)
+                if killed:
                     self.state = GameState.GAME_OVER
                     return
 
@@ -315,6 +366,15 @@ class Game:
         if not all(enemy.active for enemy in self.enemies):
             self.enemies = [enemy for enemy in self.enemies if enemy.active]
 
+        # 更新掉落物（上下浮动动画）
+        if self.pickups:
+            active_pickups = []
+            for pickup in self.pickups:
+                if pickup.active:
+                    pickup.update(dt)
+                    active_pickups.append(pickup)
+            self.pickups = active_pickups
+
         # 科技研究
         if self.tech_researching:
             self.tech_research_timer -= dt
@@ -335,6 +395,36 @@ class Game:
 
     def _handle_input(self, dt):
         """处理输入"""
+        # 加工面板打开时
+        if self.craft_panel_open:
+            if rl.IsKeyPressed(rl.KEY_B) or rl.IsKeyPressed(rl.KEY_ESCAPE):
+                self.craft_panel_open = False
+                return
+            # 1-3: 加工（自动选徒手/工具）
+            if rl.IsKeyPressed(rl.KEY_ONE):
+                self._craft_panel_action("process", "wood->plank")
+            elif rl.IsKeyPressed(rl.KEY_TWO):
+                self._craft_panel_action("process", "stone->cobble")
+            elif rl.IsKeyPressed(rl.KEY_THREE):
+                self._craft_panel_action("process", "iron_ore->ingot")
+            # 4-7: 合成武器
+            elif rl.IsKeyPressed(rl.KEY_FOUR):
+                self._craft_panel_action("weapon", "wood_club")
+            elif rl.IsKeyPressed(rl.KEY_FIVE):
+                self._craft_panel_action("weapon", "stone_axe")
+            elif rl.IsKeyPressed(rl.KEY_SIX):
+                self._craft_panel_action("weapon", "iron_sword")
+            elif rl.IsKeyPressed(rl.KEY_SEVEN):
+                self._craft_panel_action("weapon", "sand_sling")
+            # 8-0: 合成工具
+            elif rl.IsKeyPressed(rl.KEY_EIGHT):
+                self._craft_panel_action("tool", "saw")
+            elif rl.IsKeyPressed(rl.KEY_NINE):
+                self._craft_panel_action("tool", "hammer")
+            elif rl.IsKeyPressed(rl.KEY_ZERO):
+                self._craft_panel_action("tool", "furnace")
+            return
+
         # T 键打开科技面板
         if rl.IsKeyPressed(rl.KEY_T) and self.state == GameState.PLAYING:
             self.state = GameState.TECH_PANEL
@@ -350,6 +440,7 @@ class Game:
                 if rl.IsKeyPressed(rl.KEY_ONE + i) and i < 5:
                     self._research_tech(tech_name)
         elif self.state == GameState.PLAYING:
+            # 数字键: 选择经典塔
             if rl.IsKeyPressed(rl.KEY_ONE):
                 self._select_tower_type("stone_thrower")
             elif rl.IsKeyPressed(rl.KEY_TWO):
@@ -358,31 +449,235 @@ class Game:
                 self._select_tower_type("sand_trap")
             elif rl.IsKeyPressed(rl.KEY_FOUR):
                 self._select_tower_type("metal_tower")
+            # 5-8: 选择武器装备放置
+            elif rl.IsKeyPressed(rl.KEY_FIVE):
+                self._select_weapon("wood_club")
+            elif rl.IsKeyPressed(rl.KEY_SIX):
+                self._select_weapon("stone_axe")
+            elif rl.IsKeyPressed(rl.KEY_SEVEN):
+                self._select_weapon("iron_sword")
+            elif rl.IsKeyPressed(rl.KEY_EIGHT):
+                self._select_weapon("sand_sling")
+            # B 键: 打开加工/合成面板
+            elif rl.IsKeyPressed(rl.KEY_B):
+                self._toggle_craft_panel()
+            # X 键: 切换拆除模式
+            elif rl.IsKeyPressed(rl.KEY_X):
+                self._toggle_dismantle()
             elif rl.IsKeyPressed(rl.KEY_ESCAPE):
                 self.placing_tower = False
                 self.selected_tower_type = None
+                self.interaction_mode = "none"
+                self.selected_weapon = None
 
-            # 鼠标点击: 放置塔，或点击已有塔升级
+            # 鼠标点击: 优先级链
             if rl.IsMouseButtonPressed(rl.MOUSE_BUTTON_LEFT):
-                if self.placing_tower and self.selected_tower_type:
+                if self.interaction_mode == "dismantle":
+                    self._try_dismantle_tower()
+                elif self.placing_tower and self.selected_tower_type:
                     self._try_place_tower()
+                elif self.selected_weapon:
+                    self._try_place_weapon_tower()
                 else:
-                    self._try_upgrade_tower()
+                    # 默认: 拾取 → 升级塔 → 采集道具
+                    # 拾取优先:掉落物常落在塔脚下,先拾取可避免被升级逻辑截胡
+                    picked = self._try_pickup()
+                    if not picked:
+                        upgraded = self._try_upgrade_tower()
+                        if not upgraded:
+                            self._try_harvest_prop()
 
-    def _try_upgrade_tower(self):
-        """点击已有塔进行升级"""
+    def _try_upgrade_tower(self) -> bool:
+        """点击已有塔进行升级，返回是否成功"""
         wx, wy, wz = self.camera.screen_to_world(rl.GetMouseX(), rl.GetMouseY())
-        x, z = int(wx), int(wz)
+        x, z = math.floor(wx), math.floor(wz)
         for tower in self.towers:
-            if abs(tower.position[0] - x) <= 1 and abs(tower.position[2] - z) <= 1:
+            # 塔位是世界坐标（方块中心），故与格子中心 (x+0.5, z+0.5) 比较
+            # 命中范围收紧到塔自身所在格(中心距 <= 0.6)，避免误抓邻近格的点击
+            if abs(tower.position[0] - (x + 0.5)) <= 0.6 and abs(tower.position[2] - (z + 0.5)) <= 0.6:
                 if tower.level >= config.MAX_TOWER_LEVEL:
-                    return
+                    self.toast("已达最高等级")
+                    return True
                 cost = tower.upgrade_cost
                 if self.money < cost:
-                    return
+                    self.toast(f"金钱不足 (需要 {cost})")
+                    return True
                 tower.upgrade()
                 self.money -= cost
+                self.toast(f"升级为 Lv{tower.level}")
+                return True
+        return False
+
+    def _try_harvest_prop(self):
+        """点击采集地表装饰物"""
+        wx, wy, wz = self.camera.screen_to_world(rl.GetMouseX(), rl.GetMouseY())
+        x, z = math.floor(wx), math.floor(wz)
+        prop = self.universe.props_by_cell.get((x, z))
+        if prop and prop.prop_type.harvest_material:
+            mat_name = prop.prop_type.harvest_material
+            mat_amount = prop.prop_type.harvest_amount
+            self.inventory.add_material(mat_name, mat_amount)
+            # 从全局和区块列表中移除
+            prop.harvested = True
+            self.universe.remove_prop(prop)
+            self.toast(f"+{mat_amount} {MATERIAL_NAMES_CN.get(mat_name, mat_name)}")
+        elif prop:
+            self.toast("该装饰物不可采集")
+        else:
+            self.toast("此处没有可采集物")
+
+    def _try_pickup(self) -> bool:
+        """点击拾取地面掉落物，返回是否拾取成功
+
+        screen_to_world 返回射线与地形的交点(地面点)，而掉落物悬浮在地面上方。
+        相机俯角较斜(~29°)时，瞄准可见的悬浮物品，地面交点会向斜后方偏移约
+        1 格(视差)。掉落物的 xz 本就是它的地面投影，因此直接与点击地面点比较，
+        并把拾取半径放宽到 1.8 格以吸收视差偏移；选最近的一个，避免漏捡。
+        """
+        wx, wy, wz = self.camera.screen_to_world(rl.GetMouseX(), rl.GetMouseY())
+        PICKUP_RADIUS_SQ = 1.8 * 1.8  # 半径 1.8 格，吸收悬浮视差
+        nearest = None
+        nearest_d2 = PICKUP_RADIUS_SQ
+        for pickup in self.pickups:
+            if not pickup.active:
+                continue
+            dx = pickup.position[0] - wx
+            dz = pickup.position[2] - wz
+            d2 = dx * dx + dz * dz
+            if d2 < nearest_d2:
+                nearest = pickup
+                nearest_d2 = d2
+        if nearest is None:
+            return False
+        pickup = nearest
+        # 收入背包
+        if pickup.item_type == "material":
+            self.inventory.add_material(pickup.item_name, pickup.amount)
+            self.toast(f"+{pickup.amount} {MATERIAL_NAMES_CN.get(pickup.item_name, pickup.item_name)}")
+        elif pickup.item_type == "weapon":
+            self.inventory.add_weapon(pickup.item_name, pickup.amount)
+            wdef = WEAPON_TYPES.get(pickup.item_name)
+            label = wdef.label_cn if wdef else pickup.item_name
+            self.toast(f"+{pickup.amount} {label}")
+        pickup.active = False
+        return True
+
+    def _try_dismantle_tower(self):
+        """拆除塔并回收材料"""
+        wx, wy, wz = self.camera.screen_to_world(rl.GetMouseX(), rl.GetMouseY())
+        x, z = math.floor(wx), math.floor(wz)
+        for i, tower in enumerate(self.towers):
+            if abs(tower.position[0] - (x + 0.5)) <= 1 and abs(tower.position[2] - (z + 0.5)) <= 1:
+                # 获取材料配方
+                if tower.source and tower.source[0] == "weapon":
+                    wdef = WEAPON_TYPES.get(tower.source[1])
+                    recipe = wdef.recipe if wdef else {}
+                else:
+                    recipe = CLASSIC_TOWER_MATERIALS.get(tower.source[1] if tower.source else "", {})
+                # 回收材料
+                refund = dismantle_refund(recipe)
+                for mat, amt in refund.items():
+                    self.inventory.add_material(mat, amt)
+                self.towers.pop(i)
+                self.toast("已拆除，材料已回收")
                 return
+        self.toast("未找到可拆除的塔")
+
+    def _try_place_weapon_tower(self):
+        """放置武器塔"""
+        if not self.selected_weapon:
+            return
+        wx, wy, wz = self.camera.screen_to_world(rl.GetMouseX(), rl.GetMouseY())
+        x, z = math.floor(wx), math.floor(wz)
+        if not self._is_valid_placement(x, z):
+            self.toast("无法在此放置")
+            return
+        install_fee = self.selected_weapon.install_fee
+        if self.money < install_fee:
+            self.toast(f"安装费不足 (需要 {install_fee})")
+            return
+        if self.inventory.remove_weapon(self.selected_weapon.name, 1):
+            y = self.universe.get_surface_height(x, z) + 1
+            tower = Tower.from_weapon(self.selected_weapon, (x + 0.5, y, z + 0.5),
+                                       damage_mult=self.tech_damage_mult())
+            self.towers.append(tower)
+            self.money -= install_fee
+            self.toast(f"已安装 {self.selected_weapon.label_cn} 塔 (-{install_fee}$)")
+            self.selected_weapon = None
+        else:
+            self.toast("背包中没有该武器")
+
+    def _toggle_craft_panel(self):
+        """切换加工/合成面板"""
+        self.craft_panel_open = not self.craft_panel_open
+        if self.craft_panel_open:
+            self.interaction_mode = "none"
+            self.placing_tower = False
+            self.selected_tower_type = None
+            self.selected_weapon = None
+
+    def _toggle_dismantle(self):
+        """切换拆除模式"""
+        if self.interaction_mode == "dismantle":
+            self.interaction_mode = "none"
+            self.toast("拆除模式关闭")
+        else:
+            self.interaction_mode = "dismantle"
+            self.placing_tower = False
+            self.selected_tower_type = None
+            self.selected_weapon = None
+            self.toast("拆除模式开启 - 点击塔拆除")
+
+    def _craft_panel_action(self, action_type: str, target: str):
+        """加工面板内的操作"""
+        if action_type == "process":
+            recipe = PROCESS_RECIPES.get(target)
+            if not recipe:
+                return
+            # 检查是否有适用工具
+            required_tool = recipe.get("requires_tool")
+            use_tool = False
+            if required_tool:
+                # 必需工具：没有就不能加工
+                if not self.inventory.has_tool(required_tool):
+                    self.toast(f"需要工具: {TOOL_TYPES[required_tool].label_cn}")
+                    return
+                use_tool = True
+            else:
+                # 可选工具：有就加速/增产
+                for tname, tdef in TOOL_TYPES.items():
+                    if tdef.applies == target and self.inventory.has_tool(tname):
+                        use_tool = True
+                        break
+            if not use_tool:
+                # 没有工具时，检查徒手是否可行
+                if recipe["hand"] <= 0:
+                    self.toast("需要工具才能加工")
+                    return
+            ok, out_mat, amt = process(target, self.inventory, use_tool=use_tool)
+            if ok:
+                mode = "工具" if use_tool else "徒手"
+                self.toast(f"+{amt} {MATERIAL_NAMES_CN.get(out_mat, out_mat)} ({mode})")
+            else:
+                self.toast("材料不足或条件不满足")
+
+        elif action_type == "weapon":
+            if can_craft_weapon(target, self.inventory):
+                craft_weapon(target, self.inventory)
+                wdef = WEAPON_TYPES.get(target)
+                self.toast(f"合成 {wdef.label_cn} 成功")
+            else:
+                wdef = WEAPON_TYPES.get(target)
+                self.toast(f"无法合成 {wdef.label_cn}: 材料不足")
+
+        elif action_type == "tool":
+            if can_craft_tool(target, self.inventory):
+                craft_tool(target, self.inventory)
+                tdef = TOOL_TYPES.get(target)
+                self.toast(f"合成 {tdef.label_cn} 成功")
+            else:
+                tdef = TOOL_TYPES.get(target)
+                self.toast(f"无法合成 {tdef.label_cn}: 材料不足")
 
     def _select_tower_type(self, type_name):
         """选择塔类型"""
@@ -400,6 +695,20 @@ class Game:
         self.selected_tower_type = tower_type
         self.placing_tower = True
 
+    def _select_weapon(self, weapon_name):
+        """选择武器装备放置"""
+        wdef = WEAPON_TYPES.get(weapon_name)
+        if not wdef:
+            return
+        if self.inventory.get_weapon(weapon_name) < 1:
+            self.toast(f"背包中没有 {wdef.label_cn}")
+            return
+        self.selected_weapon = wdef
+        self.selected_tower_type = None
+        self.placing_tower = False
+        self.interaction_mode = "none"
+        self.toast(f"放置 {wdef.label_cn} (${wdef.install_fee})")
+
     def toast(self, message, duration=2.0):
         """屏幕提示"""
         self.toast_message = message
@@ -412,7 +721,7 @@ class Game:
 
         # 获取鼠标位置的世界坐标
         wx, wy, wz = self.camera.screen_to_world(rl.GetMouseX(), rl.GetMouseY())
-        x, z = int(wx), int(wz)
+        x, z = math.floor(wx), math.floor(wz)
 
         # 检查位置有效性
         if not self._is_valid_placement(x, z):
@@ -425,7 +734,7 @@ class Game:
 
         # 放置塔（应用科技伤害加成）
         y = self.universe.get_surface_height(x, z) + 1
-        tower = Tower(self.selected_tower_type, (x, y, z),
+        tower = Tower(self.selected_tower_type, (x + 0.5, y, z + 0.5),
                       damage_mult=self.tech_damage_mult())
         self.towers.append(tower)
         self.money -= cost
@@ -435,19 +744,23 @@ class Game:
         self.selected_tower_type = None
 
     def _is_valid_placement(self, x, z):
-        """检查放置位置是否有效"""
-        size = self.universe.size
-        if x < 0 or x >= size or z < 0 or z >= size:
+        """检查放置位置是否有效（无限地形，无边界限制）"""
+        # 不能放在海洋/水下
+        biome = self.universe.get_biome_safe(x, z)
+        if biome == "ocean":
             return False
 
-        # 不能放在路径上
-        for px, py, pz in self.universe.enemy_path:
-            if abs(px - x) < 1 and abs(pz - z) < 1:
-                return False
+        # 不能放在大本营上
+        if abs(x - self.universe.base_x) <= 2 and abs(z - self.universe.base_z) <= 2:
+            return False
+
+        # 不能放在任何路径上（O(1) 查找）
+        if self.universe._is_on_path(x, z):
+            return False
 
         # 不能放在已有塔的位置
         for tower in self.towers:
-            if abs(tower.position[0] - x) < 1 and abs(tower.position[2] - z) < 1:
+            if abs(tower.position[0] - (x + 0.5)) < 1 and abs(tower.position[2] - (z + 0.5)) < 1:
                 return False
 
         return True
@@ -456,200 +769,46 @@ class Game:
         """渲染游戏"""
         begin_drawing()
 
-        # 渲染世界
+        # 渲染世界（预览/高亮在相机上下文内渲染）
         entities = {
             "towers": self.towers,
             "enemies": self.enemies,
             "projectiles": self.projectiles,
+            "pickups": self.pickups,
         }
-        self.renderer.render(self.camera, self.universe, entities)
+        # 构建相机内额外渲染回调（放置预览 + 拆除高亮）
+        _need_preview = (self.placing_tower and self.selected_tower_type) or self.selected_weapon
+        _need_dismantle = (self.interaction_mode == "dismantle")
+        camera_extra = None
+        if _need_preview or _need_dismantle:
+            def camera_extra():
+                if _need_preview:
+                    self.ui.render_placement_preview(self)
+                if _need_dismantle:
+                    self.ui.render_dismantle_highlight(self)
 
-        # 渲染放置预览
-        if self.placing_tower and self.selected_tower_type:
-            self._render_placement_preview()
+        self.renderer.render(self.camera, self.universe, entities, camera_extra)
 
         # 渲染 HUD
-        self._render_hud()
+        self.ui.render_hud(self)
 
         # 渲染波次公告
         if self.wave_announcement_timer > 0:
-            self._render_wave_announcement()
+            self.ui.render_wave_announcement(self)
 
         # 渲染科技面板
         if self.state == GameState.TECH_PANEL:
-            self._render_tech_panel()
+            self.ui.render_tech_panel(self)
+
+        # 渲染加工面板
+        if self.craft_panel_open:
+            self.ui.render_craft_panel(self)
 
         # 渲染游戏结束
         if self.state == GameState.GAME_OVER:
-            self._render_game_over()
+            self.ui.render_game_over(self)
 
         end_drawing()
-
-    def _render_placement_preview(self):
-        """渲染塔放置预览"""
-        wx, wy, wz = self.camera.screen_to_world(rl.GetMouseX(), rl.GetMouseY())
-        x, z = int(wx), int(wz)
-        valid = self._is_valid_placement(x, z)
-        cost = self.selected_tower_type.base_cost
-        can_afford = self.money >= cost
-
-        c = color(100, 255, 100) if valid and can_afford else color(255, 100, 100)
-        alpha = 0.5 if valid and can_afford else 0.3
-        set_alpha(alpha)
-        draw_cube(vec3(x + 0.5, self.universe.get_surface_height(x, z) + 1.0, z + 0.5),
-                  0.6, 1.0, 0.6, c)
-        set_alpha(1.0)
-
-        # 绘制射程圈
-        if valid:
-            set_alpha(0.2)
-            draw_circle_v(vec2(x + 0.5, z + 0.5),
-                          self.selected_tower_type.base_range, color(100, 200, 100))
-            set_alpha(1.0)
-
-    def _render_hud(self):
-        """渲染 HUD"""
-        # 顶部信息栏
-        draw_rect(0, 0, rl.GetScreenWidth(), 40, color(20, 20, 30, 200))
-
-        draw_text(f"Wave: {self.wave}", 10, 12, 14, color(220, 220, 240))
-        draw_text(f"Money: {self.money}", 120, 12, 14, color(255, 215, 0))
-        draw_text(f"Lives: {self.lives}", 250, 12, 14, color(255, 80, 80))
-        draw_text(f"Score: {self.score}", 360, 12, 14, color(180, 255, 180))
-        draw_text(f"FPS: {self.fps}", rl.GetScreenWidth() - 100, 12, 14, color(150, 150, 175))
-
-        # 塔选择栏 — 未解锁的塔标记为锁
-        bar_y = rl.GetScreenHeight() - 60
-        draw_rect(0, bar_y, rl.GetScreenWidth(), 50, color(30, 30, 40, 200))
-
-        labels = [("1", "Stone"), ("2", "Water"), ("3", "Sand"), ("4", "Metal")]
-        keys = ["stone_thrower", "water_cannon", "sand_trap", "metal_tower"]
-        parts = ["Towers:"]
-        for (key, label), type_name in zip(labels, keys):
-            tt = TOWER_TYPES[type_name]
-            if tt.requires_tech:
-                missing = [t for t in tt.requires_tech if t not in self.unlocked_tech]
-                if missing:
-                    parts.append(f"[{key}]{label} (lock)")
-                    continue
-            parts.append(f"[{key}]{label}")
-        draw_text(" ".join(parts), 10, bar_y + 8, 12, color(180, 180, 200))
-        draw_text("V:2D/3D | T:Tech | Esc:Cancel | Click:Place/Upgrade", 10, bar_y + 28, 11, color(150, 150, 175))
-
-        # 当前选择
-        if self.selected_tower_type:
-            tc = color(*self.selected_tower_type.color)
-            draw_circle_v(vec2(rl.GetScreenWidth() - 100, bar_y + 15), 8, tc)
-            draw_text(f"${self.tower_cost(self.selected_tower_type)}",
-                      rl.GetScreenWidth() - 85, bar_y + 10, 12, color(255, 215, 0))
-
-        # 正在研究科技
-        if self.tech_researching:
-            frac = 1.0 - self.tech_research_timer / max(1e-6, self.tech_research_total)
-            draw_text(f"Researching: {self.tech_researching} ({frac*100:.0f}%)",
-                      10, bar_y - 22, 12, color(255, 200, 100))
-
-        # 屏幕提示
-        if self.toast_timer > 0 and self.toast_message:
-            draw_text_centered(self.toast_message, bar_y - 22, 14, color(255, 220, 140))
-
-    def _render_wave_announcement(self):
-        """渲染波次公告"""
-        alpha = min(1.0, self.wave_announcement_timer)
-        set_alpha(alpha)
-        draw_text_centered(f"WAVE {self.wave}",
-                           rl.GetScreenHeight() // 2 - 20, 36, color(255, 255, 255))
-        if self.between_waves:
-            draw_text_centered(f"Next wave in {self.wave_timer:.1f}s",
-                               rl.GetScreenHeight() // 2 + 20, 16, color(200, 200, 220))
-        else:
-            draw_text_centered(f"Enemies: {self.wave_enemy_count}/{self.wave_max_enemies}",
-                               rl.GetScreenHeight() // 2 + 20, 16, color(200, 200, 220))
-        set_alpha(1.0)
-
-    # 科技说明（用于面板展示）
-    TECH_DESC = {
-        "handcraft": "塔伤害 +10%",
-        "stone_mining": "建造费用 -15%",
-        "biomass_energy": "前置: 水机械学",
-        "water_mechanics": "解锁 [2] Water Cannon",
-        "metallurgy": "解锁 [4] Metal Tower",
-    }
-
-    def _render_tech_panel(self):
-        """渲染科技面板"""
-        # 半透明背景
-        set_alpha(0.7)
-        draw_rect(0, 0, rl.GetScreenWidth(), rl.GetScreenHeight(), color(0, 0, 0))
-        set_alpha(1.0)
-
-        # 面板
-        pw = 680
-        ph = 420
-        px = (rl.GetScreenWidth() - pw) // 2
-        py = (rl.GetScreenHeight() - ph) // 2
-
-        draw_rect(px, py, pw, ph, color(40, 45, 60))
-        draw_rect_lines(rect(px, py, pw, ph), 2, color(100, 150, 200))
-
-        draw_text_centered("TECHNOLOGY TREE", py + 20, 24, color(220, 220, 240))
-        draw_text(f"Money: {self.money}   |   Press 1-5 to research   |   T/Esc: close",
-                  px + 10, py + ph - 30, 12, color(150, 150, 175))
-
-        # 已解锁科技
-        tech_y = py + 62
-        draw_text(f"Unlocked: {', '.join(self.unlocked_tech) if self.unlocked_tech else 'None'}",
-                  px + 10, tech_y, 14, color(180, 255, 180))
-        tech_y += 28
-
-        draw_text("Available Research:", px + 10, tech_y, 14, color(200, 200, 220))
-        tech_y += 22
-
-        for i, (tech, defn) in enumerate(config.TECH_TREE.items()):
-            if tech in self.unlocked_tech:
-                mark, tc = "[OK]", color(180, 255, 180)
-                detail = self.TECH_DESC.get(tech, "")
-            elif self.tech_researching == tech:
-                frac = 1.0 - self.tech_research_timer / max(1e-6, self.tech_research_total)
-                mark = f"[{frac*100:3.0f}%]"
-                tc = color(255, 200, 100)
-                detail = f"研究中 {self.tech_research_timer:.1f}s / {defn['time']}s"
-            else:
-                missing = [r for r in defn["requires"] if r not in self.unlocked_tech]
-                if missing:
-                    mark, tc = "[ - ]", color(90, 90, 110)
-                    detail = f"需要: {', '.join(missing)}"
-                elif self.tech_researching:
-                    mark, tc = "[ - ]", color(90, 90, 110)
-                    detail = "已有研究进行中"
-                elif self.money < defn["cost"]:
-                    mark, tc = "[ $ ]", color(255, 120, 120)
-                    detail = f"钱不够 (需 {defn['cost']})"
-                else:
-                    mark, tc = "[  ]", color(255, 240, 160)
-                    detail = f"费用 {defn['cost']} / {defn['time']}s"
-                detail += "  " + self.TECH_DESC.get(tech, "")
-
-            draw_text(f"  [{i+1}] {mark} {tech:<18} {detail}", px + 10, tech_y, 13, tc)
-            tech_y += 30
-
-        # 正在研究时画进度条
-        if self.tech_researching:
-            frac = 1.0 - self.tech_research_timer / max(1e-6, self.tech_research_total)
-            bar_w = pw - 40
-            draw_rect(px + 20, tech_y + 8, bar_w, 10, color(60, 60, 75))
-            draw_rect(px + 20, tech_y + 8, int(bar_w * frac), 10, color(255, 200, 100))
-
-    def _render_game_over(self):
-        """渲染游戏结束界面"""
-        set_alpha(0.8)
-        draw_rect(0, 0, rl.GetScreenWidth(), rl.GetScreenHeight(), color(0, 0, 0))
-        set_alpha(1.0)
-
-        draw_text_centered("GAME OVER", rl.GetScreenHeight() // 2 - 40, 40, color(255, 80, 80))
-        draw_text_centered(f"Final Score: {self.score}", rl.GetScreenHeight() // 2 + 10, 24, color(220, 220, 240))
-        draw_text_centered(f"Reached Wave: {self.wave}", rl.GetScreenHeight() // 2 + 45, 16, color(180, 180, 200))
-        draw_text_centered("Press Enter to restart", rl.GetScreenHeight() // 2 + 80, 14, color(150, 150, 175))
 
     def is_running(self):
         """游戏是否继续运行 — 始终返回 True，退出靠关闭窗口"""

@@ -3,6 +3,11 @@ config.py - 全局常量与可调参数
 所有游戏数值集中在此，便于平衡与调试
 """
 
+# ─── 日志 ──────────────────────────────────────────────────
+# raylib 日志阈值。"warning"=过滤 INFO 噪声(VAO/Mesh/Texture/Shader 的上传卸载
+# 行); "error"=仅保留错误; "none"=静默。默认 warning:保留真正的警告与错误。
+LOG_LEVEL = "warning"
+
 # ─── 窗口 ──────────────────────────────────────────────────
 WINDOW_WIDTH = 1280
 WINDOW_HEIGHT = 720
@@ -10,16 +15,30 @@ WINDOW_TITLE = "Seeded Tower Defense"
 TARGET_FPS = 240
 
 # ─── 世界 ──────────────────────────────────────────────────
-WORLD_SIZE = 48        # 地形平面尺寸 (WORLD_SIZE x WORLD_SIZE)
 WORLD_HEIGHT = 16      # 地形最大高度
 BLOCK_SIZE = 1.0       # 每个方块的世界单位大小
+
+# ─── 区块（无限地形） ────────────────────────────────────
+CHUNK_SIZE = 16               # 区块边长（方块数）
+RENDER_DISTANCE = 5           # 渲染距离（区块数）
+FOG_NEAR = 50.0               # 雾起始距离（世界单位，≥相机距离42保证焦点清晰）
+FOG_FAR = 110.0               # 雾完全遮挡距离（≈眼位到地块边缘，满雾压边）
+FOG_DENSITY = 0.018           # 全局雾密度（备用）
+MAX_LOADED_CHUNKS = 180       # LRU 上限（RENDER_DISTANCE=5 需要 ~80 个，留 2 倍余量）
+
+# ─── 大本营 ──────────────────────────────────────────────────
+BASE_HEALTH = 100             # 大本营最大生命值
+BASE_RADIUS = 3.0             # 大本营半径
+ENEMY_BASE_DAMAGE = 5         # 敌人到达大本营造成的伤害
+ENEMY_SPAWN_DISTANCE_MIN = 28  # 刷怪点最小距离
+ENEMY_SPAWN_DISTANCE_MAX = 42  # 刷怪点最大距离
 
 # ─── 种子 ──────────────────────────────────────────────────
 DEFAULT_SEED = 42      # 默认种子
 
 # ─── 相机 ──────────────────────────────────────────────────
 CAMERA_DISTANCE_MIN = 10.0
-CAMERA_DISTANCE_MAX = 80.0
+CAMERA_DISTANCE_MAX = 130.0
 CAMERA_ALTITUDE_MIN = 0.1     # 接近水平
 CAMERA_ALTITUDE_MAX = 1.4     # 接近正上方 (pi/2 ≈ 1.5708)
 CAMERA_MOVE_SPEED = 15.0
@@ -69,12 +88,10 @@ PROJECTILE_HIT_RADIUS = 0.9  # 抛射体命中半径
 TEMPERATURE_LAPSE_RATE = 1.0   # °C / 方块高度
 RAIN_PARTICLE_COUNT = 100
 SNOW_PARTICLE_COUNT = 60
-FOG_DENSITY = 0.015
 
 # ─── 渲染 ──────────────────────────────────────────────────
 TEXTURE_SIZE = 64            # 动态纹理分辨率
 ATLAS_SIZE = 4               # 纹理图集尺寸 (ATLAS_SIZE x ATLAS_SIZE 方块)
-MAX_VISIBLE_BLOCKS = 8000    # 可见面剔除上限
 
 # ─── 塔类型 ──────────────────────────────────────────────────
 # 塔定义在 entities.py 中，此处仅放颜色

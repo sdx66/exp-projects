@@ -196,8 +196,8 @@ def get_block_by_name(name: str) -> BlockDef:
 
 def is_solid(id: int) -> bool:
     """方块是否实体"""
-    return BLOCKS[id].solid
+    return BLOCKS.get(id, BLOCKS[0]).solid
 
 def is_transparent(id: int) -> bool:
     """方块是否透明"""
-    return BLOCKS[id].transparent
+    return BLOCKS.get(id, BLOCKS[0]).transparent

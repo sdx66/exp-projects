@@ -222,6 +222,11 @@ def draw_circle_v(center, radius, c):
     rl.DrawCircleV(center, radius, c)
 
 
+def draw_circle_3d(center, radius, c):
+    """地面圆环（3D，XZ 平面）- 绕 X 轴转 90°"""
+    rl.DrawCircle3D(center, radius, vec3(1, 0, 0), 90.0, c)
+
+
 def draw_circle(x, y, radius, c):
     rl.DrawCircle(int(x), int(y), radius, c)
 

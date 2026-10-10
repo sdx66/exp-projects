@@ -51,11 +51,6 @@ class SeedScreen:
             elif key == 32:
                 self.input_text += " "
 
-        char = rl.GetCharPressed()
-        if char > 0:
-            ch = chr(char)
-            if ch.isalnum() or ch == " ":
-                self.input_text += ch
 
     def draw(self):
         begin_drawing()
@@ -103,6 +98,8 @@ def main():
     rl.SetConfigFlags(rl.FLAG_VSYNC_HINT | rl.FLAG_WINDOW_RESIZABLE)
     rl.InitWindow(config.WINDOW_WIDTH, config.WINDOW_HEIGHT,
                   config.WINDOW_TITLE.encode("utf-8"))
+    _LOG_LEVELS = {"warning": rl.LOG_WARNING, "error": rl.LOG_ERROR, "none": rl.LOG_NONE}
+    rl.SetTraceLogLevel(_LOG_LEVELS.get(config.LOG_LEVEL, rl.LOG_WARNING))
     rl.SetTargetFPS(config.TARGET_FPS)
 
     # 支持命令行传入种子跳过种子界面
@@ -131,7 +128,7 @@ def main():
     from game import Game
 
     print("[初始化] 初始化相机...")
-    camera = Camera(universe.size, universe)
+    camera = Camera(universe)
 
     print("[初始化] 初始化渲染器...")
     renderer = Renderer()
@@ -144,7 +141,7 @@ def main():
     print("[提示] V: 2D/3D | T: 科技面板 | 1-4: 选塔 | 点击: 放置")
 
     while rl.WindowShouldClose() is False:
-        dt = rl.GetFrameTime()
+        dt = min(rl.GetFrameTime(), 1/30)
         game.update(dt)
         game.render()
 

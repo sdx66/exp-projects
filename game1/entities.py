@@ -6,6 +6,8 @@ Tower, Enemy, Projectile 类定义 + 类型定义
 import config
 import math
 import random
+from items import CLASSIC_TOWER_MATERIALS
+from blocks import is_solid
 
 
 # ─── 塔类型定义 ────────────────────────────────────────────
@@ -80,13 +82,15 @@ class EnemyType:
 
 
 # 可用敌人类型
+# base_health ÷2(原值 50/30/150 → 25/15/75): 修复"打不死敌人"的数值失衡。
+# 原值下基础塔 10 DPS 打不动 50 HP 敌人,÷2 后 2 塔 ~50% 击杀率,难度均衡。
 ENEMY_TYPES = {
     "regular": EnemyType("regular",
-                          base_health=50, base_speed=2.0, base_reward=10),
+                          base_health=25, base_speed=2.0, base_reward=10),
     "fast": EnemyType("fast",
-                       base_health=30, base_speed=4.0, base_reward=8),
+                       base_health=15, base_speed=4.0, base_reward=8),
     "tank": EnemyType("tank",
-                       base_health=150, base_speed=1.0, base_reward=25),
+                       base_health=75, base_speed=1.0, base_reward=25),
 }
 
 
@@ -105,6 +109,19 @@ class Tower:
         self.cooldown_timer = 0.0
         self.target = None
         self.active = True
+        # 来源：("classic", type_name) 或 ("weapon", weapon_name)
+        self.source = ("classic", tower_type.type_name)
+        # 材料配方（用于拆除回收）
+        self.material_recipe = dict(CLASSIC_TOWER_MATERIALS.get(tower_type.type_name, {}))
+
+    @staticmethod
+    def from_weapon(weapon_def, position, damage_mult=1.0):
+        """从武器定义创建塔"""
+        tower_type = _weapon_to_tower_type(weapon_def)
+        tower = Tower(tower_type, position, damage_mult=damage_mult)
+        tower.source = ("weapon", weapon_def.name)
+        tower.material_recipe = dict(weapon_def.recipe)
+        return tower
 
     def update(self, dt, enemies):
         """更新塔逻辑，返回新创建的抛射体或 None"""
@@ -175,9 +192,45 @@ class Tower:
             self.cooldown = self.type_def.base_cooldown * (config.TOWER_COOLDOWN_MULT ** (self.level - 1))
 
     @property
+    def display_color(self):
+        """获取塔的显示颜色（经典塔用 TOWER_COLORS，武器塔用 WeaponDef.color）
+
+        始终返回 4 元组 (r, g, b, a)。raylib/cffi 的 Color 结构体有 4 个字段，
+        若传入 3 元组，缺失的 alpha 字段会被 cffi 填成 0（完全透明），
+        塔虽然画出来了却完全看不见。故此处统一补满 alpha=255。
+        """
+        if self.source and self.source[0] == "weapon":
+            from items import WEAPON_TYPES
+            wdef = WEAPON_TYPES.get(self.source[1])
+            if wdef:
+                c = wdef.color
+                return c if len(c) == 4 else (*c, 255)
+        c = config.TOWER_COLORS.get(self.type_name, (128, 128, 128))
+        return c if len(c) == 4 else (*c, 255)
+
+    @property
     def upgrade_cost(self):
         """升级费用"""
         return int(self.type_def.base_cost * (config.UPGRADE_COST_MULT ** (self.level - 1)))
+
+
+def _weapon_to_tower_type(weapon_def) -> TowerType:
+    """
+    将 WeaponDef 映射为 TowerType，复用 Tower 的所有机制。
+    """
+    return TowerType(
+        type_name=weapon_def.name,
+        base_damage=weapon_def.damage,
+        base_range=weapon_def.range,
+        base_cooldown=weapon_def.cooldown,
+        base_cost=weapon_def.install_fee,
+        slow_factor=weapon_def.special.get("slow_factor", 1.0),
+        slow_duration=weapon_def.special.get("slow_duration", 0.0),
+        splash_radius=weapon_def.special.get("splash_radius", 0.0),
+        splash_falloff=weapon_def.special.get("splash_falloff", 0.5),
+        bonus_vs=weapon_def.special.get("bonus_vs", None),
+        bonus_mult=weapon_def.special.get("bonus_mult", 1.0),
+    )
 
 
 class Enemy:
@@ -282,9 +335,14 @@ class Enemy:
             target = self.path_points[self.path_index]
 
             # 计算个人化偏移：正弦摆动 + 固定偏移
+            # 最后几格内线性收敛到 0，避免横向噪声把敌人甩到大本营外面凭空消失
             wobble = math.sin(self.time * self.wobble_freq + self.wobble_phase) * self.wobble_amp
+            total = len(self.path_points)
+            tail = min(8, total)
+            remain = max(0, total - self.path_index - 1)
+            converge = 1.0 if tail == 0 else min(1.0, remain / tail)
             tx = target[0]
-            tz = target[2] + self.path_noise + wobble * 0.3
+            tz = target[2] + (self.path_noise + wobble * 0.3) * converge
 
             # 地形感知速度
             terrain_speed = self._get_terrain_speed(universe)
@@ -302,27 +360,24 @@ class Enemy:
                 self.position[0] += dx * inv_dist
                 self.position[2] += dz * inv_dist
 
-        # 防御性边界钳制：避免路径偏移/误差把敌人带出世界边界
-        self.position[0] = max(0.0, min(float(universe.size), self.position[0]))
-        self.position[2] = max(0.0, min(float(universe.size), self.position[2]))
+        # 防御性边界钳制已移除（无限地形）
 
         # 同步 Y 到地形高度
-        surface_y = universe.get_surface_height_smooth(self.position[0], self.position[2])
+        surface_y = universe.get_surface_height_smooth_safe(self.position[0], self.position[2])
         self.position[1] = surface_y + 1
 
-        # 到达终点
+        # 到达大本营
         if self.path_index >= len(self.path_points):
             self.active = False
-            return "reached"
+            return "reached_base"
 
         return None
 
     def _get_terrain_speed(self, universe):
         """根据当前地形获取速度乘数"""
-        x, z = int(self.position[0]), int(self.position[2])
-        if 0 <= x < universe.size and 0 <= z < universe.size:
-            return self.TERRAIN_SPEED_MULTS.get(universe.biomes[x][z], 1.0)
-        return 1.0
+        x, z = math.floor(self.position[0]), math.floor(self.position[2])
+        biome = universe.get_biome_safe(x, z)
+        return self.TERRAIN_SPEED_MULTS.get(biome, 1.0)
 
     def take_damage(self, amount):
         """受到伤害"""
@@ -367,11 +422,11 @@ class Projectile:
         # 应用重力
         self.velocity[1] += config.PROJECTILE_GRAVITY * dt
 
-        # 应用空气阻力
-        drag = config.PROJECTILE_DRAG
-        self.velocity[0] *= drag
-        self.velocity[1] *= drag
-        self.velocity[2] *= drag
+        # 应用空气阻力（时间基，60fps 为基准）
+        d = config.PROJECTILE_DRAG ** (dt * 60.0)
+        self.velocity[0] *= d
+        self.velocity[1] *= d
+        self.velocity[2] *= d
 
         # 更新位置
         self.position[0] += self.velocity[0] * dt
@@ -385,9 +440,9 @@ class Projectile:
             return None
 
         # 碰撞检测：地形
-        x, y, z = int(self.position[0]), int(self.position[1]), int(self.position[2])
-        block_id = universe.get_block(x, y, z)
-        if block_id != 0:
+        x, y, z = math.floor(self.position[0]), math.floor(self.position[1]), math.floor(self.position[2])
+        block_id = universe.get_block_safe(x, y, z)
+        if is_solid(block_id):
             self.active = False
             return None
 
@@ -447,3 +502,55 @@ class Projectile:
                 return result
 
         return None
+
+
+class Pickup:
+    """地面掉落物 — 可被点击拾取"""
+
+    def __init__(self, position, item_type, item_name, amount=1, rng=None):
+        """
+        position: (x, y, z)
+        item_type: "material" 或 "weapon"
+        item_name: 材料名或武器名
+        amount: 数量
+        rng: 可选的随机数生成器（种子可复现）
+        """
+        self.position = list(position)  # [x, y, z]
+        self.item_type = item_type
+        self.item_name = item_name
+        self.amount = amount
+        self.active = True
+        rand = rng or random
+        self.bob_phase = rand.uniform(0, math.tau)
+        self.bob_speed = 2.0
+        self.time = rand.uniform(0, 10)
+
+    def update(self, dt):
+        self.time += dt
+        self.bob_phase += dt * self.bob_speed
+        return self.active
+
+
+class Base:
+    """大本营 — 敌人攻击的目标"""
+
+    def __init__(self, position, max_health=100):
+        self.position = list(position)  # [x, y, z]
+        self.max_health = max_health
+        self.health = max_health
+        self.active = True
+        self.damage_flash = 0.0  # 受伤闪烁计时
+
+    def take_damage(self, amount):
+        """受到伤害"""
+        self.health = max(0, self.health - amount)
+        self.damage_flash = 0.5
+        if self.health <= 0:
+            self.active = False
+            return True  # 已摧毁
+        return False
+
+    def update(self, dt):
+        if self.damage_flash > 0:
+            self.damage_flash -= dt
+        return self.active
