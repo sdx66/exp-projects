@@ -1,9 +1,11 @@
 """
 entities.py - 游戏实体
 Tower, Enemy, Projectile 类定义 + 类型定义
+塔/敌人类型数据来自 data/towers.json / data/enemies.json（经 gamedata 构建）。
 """
 
 import config
+import gamedata
 import math
 import random
 from items import CLASSIC_TOWER_MATERIALS
@@ -40,30 +42,27 @@ class TowerType:
 
     @property
     def color(self):
-        return config.TOWER_COLORS.get(self.type_name, (128, 128, 128))
+        return gamedata.TOWER_COLORS.get(self.type_name, (128, 128, 128))
 
 
-# 可用塔类型
+# ─── 塔类型（来自 data/towers.json） ──────────────────────────
 # 设计意图: stone=基础输出, sand=控场(减速), water=清群(溅射), metal=反坦克(增伤)
-TOWER_TYPES = {
-    "stone_thrower": TowerType("stone_thrower",
-                               base_damage=10, base_range=5.0,
-                               base_cooldown=1.0, base_cost=50),
-    "water_cannon": TowerType("water_cannon",
-                              base_damage=15, base_range=4.0,
-                              base_cooldown=0.8, base_cost=80,
-                              requires_tech=["biomass_energy", "water_mechanics"],
-                              splash_radius=2.2, splash_falloff=0.5),
-    "sand_trap": TowerType("sand_trap",
-                           base_damage=5, base_range=3.0,
-                           base_cooldown=0.5, base_cost=40,
-                           slow_factor=0.45, slow_duration=2.0),
-    "metal_tower": TowerType("metal_tower",
-                             base_damage=30, base_range=7.0,
-                             base_cooldown=1.2, base_cost=200,
-                             requires_tech=["metallurgy"],
-                             bonus_vs="tank", bonus_mult=2.0),
-}
+TOWER_TYPES = {}
+for _name, _d in gamedata.TOWERS_RAW.items():
+    TOWER_TYPES[_name] = TowerType(
+        _name,
+        base_damage=_d["base_damage"],
+        base_range=_d["base_range"],
+        base_cooldown=_d["base_cooldown"],
+        base_cost=_d["base_cost"],
+        requires_tech=list(_d.get("requires_tech", [])),
+        slow_factor=_d.get("slow_factor", 1.0),
+        slow_duration=_d.get("slow_duration", 0.0),
+        splash_radius=_d.get("splash_radius", 0.0),
+        splash_falloff=_d.get("splash_falloff", 0.5),
+        bonus_vs=_d.get("bonus_vs"),
+        bonus_mult=_d.get("bonus_mult", 1.0),
+    )
 
 
 # ─── 敌人类型定义 ──────────────────────────────────────────
@@ -78,20 +77,20 @@ class EnemyType:
 
     @property
     def color(self):
-        return config.ENEMY_COLORS.get(self.type_name, (200, 50, 50))
+        return gamedata.ENEMY_COLORS.get(self.type_name, (200, 50, 50))
 
 
-# 可用敌人类型
-# base_health ÷2(原值 50/30/150 → 25/15/75): 修复"打不死敌人"的数值失衡。
+# 敌人类型（来自 data/enemies.json 的 base_health/base_speed/base_reward）
+# 基础血量已 ÷2(原值 50/30/150 → 25/15/75): 修复"打不死敌人"的数值失衡。
 # 原值下基础塔 10 DPS 打不动 50 HP 敌人,÷2 后 2 塔 ~50% 击杀率,难度均衡。
-ENEMY_TYPES = {
-    "regular": EnemyType("regular",
-                          base_health=25, base_speed=2.0, base_reward=10),
-    "fast": EnemyType("fast",
-                       base_health=15, base_speed=4.0, base_reward=8),
-    "tank": EnemyType("tank",
-                       base_health=75, base_speed=1.0, base_reward=25),
-}
+ENEMY_TYPES = {}
+for _name, _d in gamedata.ENEMIES_RAW.items():
+    ENEMY_TYPES[_name] = EnemyType(
+        _name,
+        base_health=_d["base_health"],
+        base_speed=_d["base_speed"],
+        base_reward=_d["base_reward"],
+    )
 
 
 class Tower:
@@ -205,7 +204,7 @@ class Tower:
             if wdef:
                 c = wdef.color
                 return c if len(c) == 4 else (*c, 255)
-        c = config.TOWER_COLORS.get(self.type_name, (128, 128, 128))
+        c = gamedata.TOWER_COLORS.get(self.type_name, (128, 128, 128))
         return c if len(c) == 4 else (*c, 255)
 
     @property
@@ -237,16 +236,10 @@ class Enemy:
     """敌人 — 支持多路径选择、地形感知、个性差异"""
 
     # 敌人性格参数：direct(偏好直线), terrain_aware(避开难走地形), aggressive(偏好开阔)
-    PERSONALITIES = {
-        "regular": {"direct": 0.5, "terrain_aware": 0.5, "aggressive": 0.5, "wobble": 0.5},
-        "fast":    {"direct": 0.9, "terrain_aware": 0.2, "aggressive": 0.8, "wobble": 0.8},
-        "tank":    {"direct": 0.2, "terrain_aware": 0.9, "aggressive": 0.3, "wobble": 0.3},
-    }
+    # 来自 data/enemies.json 每类型的 personality 字段
+    PERSONALITIES = gamedata.ENEMY_PERSONALITIES
 
-    TERRAIN_SPEED_MULTS = {
-        "plains": 1.25, "forest": 1.0, "mountain": 0.6, "ocean": 0.4,
-        "desert": 1.15, "tundra": 0.85, "savanna": 1.1,
-    }
+    TERRAIN_SPEED_MULTS = gamedata.TERRAIN_SPEED_MULTS
 
     def __init__(self, enemy_type, position, path, all_paths=None, path_index=0, rng=None):
         self.type_name = enemy_type.type_name
@@ -278,7 +271,45 @@ class Enemy:
         self.wobble_freq = rng.uniform(0.3, 1.0)
         self.wobble_phase = rng.uniform(0, math.tau)
         self.time = rng.uniform(0, 10)  # 错开初始相位
-        self.path_noise = rng.uniform(-1.5, 1.5)  # 整体 Z 偏移
+        self.path_noise = rng.uniform(-0.3, 0.3)  # 整体法线偏移（限幅后仍 ≤0.45 路径半宽）
+
+        # 行为状态机：wave / scout_wander / scout_return
+        self.behavior = "wave"
+        self.home_spawner_id = -1
+        self.has_message = False
+        self.scout_returned_with_message = False
+        self.wander_heading = rng.uniform(0, math.tau)
+        self.wander_turn_timer = 0.0
+        self.wander_lifetime = 0.0
+        self.return_path = ()
+        self.return_path_index = 0
+        # 侦察兵配置（as_scout 时按刷怪点种类注入；无配置用标准种类兜底）
+        self.scout_cfg = None
+
+    @staticmethod
+    def as_scout(enemy_type, position, home_spawner_id, rng,
+                 noise_dir=None, scout_cfg=None):
+        """创建侦察怪（scout_wander 行为）—— 由休眠刷怪点触发派出。
+
+        noise_dir: (dx, dz) 噪音方向（朝最大噪音源），若有则初始 heading 偏向它。
+        scout_cfg: 刷怪点种类的侦察兵属性（data/spawners.json），None 用标准种类。
+        """
+        cfg = scout_cfg or gamedata.STANDARD_SCOUT
+        scout = Enemy(enemy_type, position, path=None, rng=rng)
+        scout.scout_cfg = cfg
+        scout.behavior = "scout_wander"
+        scout.home_spawner_id = home_spawner_id
+        jitter = cfg.get("noise_jitter", 0.5)
+        if noise_dir and (noise_dir[0] or noise_dir[1]):
+            # 初始方向偏向噪音源 + 随机扰动
+            base_heading = math.atan2(noise_dir[1], noise_dir[0])
+            scout.wander_heading = base_heading + rng.uniform(-jitter, jitter)
+        else:
+            scout.wander_heading = rng.uniform(0, math.tau)
+        scout.wander_turn_timer = 0.0  # 立刻触发首次换向（含避水纠正）
+        scout.wander_lifetime = cfg.get("wander_duration", 60.0)
+        scout.speed = enemy_type.base_speed * cfg.get("wander_speed_mult", 0.8)
+        return scout
 
     @staticmethod
     def pick_path(enemy_type, all_paths, existing_enemies=None, rng=None):
@@ -317,8 +348,8 @@ class Enemy:
 
         return all_paths[best_idx]
 
-    def update(self, dt, universe):
-        """更新敌人移动 — 支持地形感知、个性差异、路径偏移"""
+    def update(self, dt, universe, towers=None, base=None):
+        """更新敌人移动 — 按行为分派：wave / scout_wander / scout_return"""
         if not self.active:
             return
 
@@ -330,24 +361,81 @@ class Enemy:
             if self.slow_timer <= 0:
                 self.slow_factor = 1.0
 
-        # 沿路径移动（带个人化偏移）
+        if self.behavior == "scout_wander":
+            return self._update_scout_wander(dt, universe, towers, base)
+        elif self.behavior == "scout_return":
+            return self._update_scout_return(dt, universe)
+        else:
+            return self._update_wave(dt, universe)
+
+    def _sync_y(self, dt, universe):
+        """同步 Y 到地形高度（所有行为共用）。
+
+        足迹半径用敌人实际半宽 0.2（盒宽 0.4）：只把敌人盒子真正压住的列算立足点。
+        纯噪声高度，不依赖 chunk 加载状态，卸载与否结果一致。
+        """
+        x, y, z = self.position
+        ix0 = int(math.floor(x - 0.2))
+        ix1 = int(math.floor(x + 0.2))
+        iz0 = int(math.floor(z - 0.2))
+        iz1 = int(math.floor(z + 0.2))
+        top = 0
+        for ix in range(ix0, ix1 + 1):
+            for iz in range(iz0, iz1 + 1):
+                h = universe._surface_height_pure(ix, iz)
+                if h > top:
+                    top = h
+        ground_y = top + 1
+        if self.position[1] < ground_y:
+            self.position[1] = ground_y
+        elif self.position[1] > ground_y:
+            self.position[1] = max(ground_y, self.position[1] - 12.0 * dt)
+
+    def _update_wave(self, dt, universe):
+        """波次怪：沿路径走向大本营（原路径跟随逻辑）。"""
         if self.path_index < len(self.path_points):
             target = self.path_points[self.path_index]
 
-            # 计算个人化偏移：正弦摆动 + 固定偏移
+            # 个人化偏移：正弦摆动 + 固定偏移，沿路径段法线方向施加
+            # （原实现只偏移全局 Z，对南北向路径不产生横向偏移；改为沿法线后
+            #   对任意朝向路径都有效，且限幅在路径半宽内，敌人不再走出路面）
             # 最后几格内线性收敛到 0，避免横向噪声把敌人甩到大本营外面凭空消失
             wobble = math.sin(self.time * self.wobble_freq + self.wobble_phase) * self.wobble_amp
             total = len(self.path_points)
             tail = min(8, total)
             remain = max(0, total - self.path_index - 1)
             converge = 1.0 if tail == 0 else min(1.0, remain / tail)
-            tx = target[0]
-            tz = target[2] + (self.path_noise + wobble * 0.3) * converge
 
-            # 地形感知速度
+            # 路径段方向 → 垂直单位向量
+            prev = None
+            seg = None
+            if 0 < self.path_index < len(self.path_points):
+                prev = self.path_points[self.path_index - 1]
+                seg = self.path_points[self.path_index]
+            elif self.path_index + 1 < len(self.path_points):
+                prev = self.path_points[self.path_index]
+                seg = self.path_points[self.path_index + 1]
+            if prev is not None and seg is not None:
+                sdx = seg[0] - prev[0]
+                sdz = seg[2] - prev[2]
+                sdist = (sdx * sdx + sdz * sdz) ** 0.5
+                if sdist > 1e-6:
+                    nx = -sdz / sdist
+                    nz = sdx / sdist
+                else:
+                    nx, nz = 0.0, 1.0
+            else:
+                nx, nz = 0.0, 1.0
+
+            offset = (self.path_noise + wobble * 0.3) * converge
+            # 限幅到 0.3：敌人盒 0.4 宽(半宽0.2)，0.3 偏移使敌人完全落在 1x1 路径格
+            # 内(格半宽0.5)，不伸入相邻格——相邻格是玩家可放塔的位置，故不会穿塔
+            offset = max(-0.3, min(0.3, offset))
+            tx = target[0] + nx * offset
+            tz = target[2] + nz * offset
+
             terrain_speed = self._get_terrain_speed(universe)
 
-            # 计算 XZ 距离
             dx = tx - self.position[0]
             dz = tz - self.position[2]
             dist_sq = dx * dx + dz * dz
@@ -360,17 +448,188 @@ class Enemy:
                 self.position[0] += dx * inv_dist
                 self.position[2] += dz * inv_dist
 
-        # 防御性边界钳制已移除（无限地形）
-
-        # 同步 Y 到地形高度
-        surface_y = universe.get_surface_height_smooth_safe(self.position[0], self.position[2])
-        self.position[1] = surface_y + 1
+        self._sync_y(dt, universe)
 
         # 到达大本营
         if self.path_index >= len(self.path_points):
             self.active = False
             return "reached_base"
 
+        return None
+
+    def _noise_direction(self, towers, base):
+        """计算噪音方向（指向噪音最大的源）。
+
+        噪音源 = 塔 + 大本营。1/dist² 衰减加权合成方向。
+        返回 (dx, dz) 单位不归一化（方向 + 强度）。
+        """
+        total_dx, total_dz = 0.0, 0.0
+        sources = []
+        if base and base.active:
+            sources.append((base.position[0], base.position[2]))
+        for tower in towers:
+            sources.append((tower.position[0], tower.position[2]))
+        if not sources:
+            return (0.0, 0.0)
+        for sx, sz in sources:
+            dx = sx - self.position[0]
+            dz = sz - self.position[2]
+            dist_sq = dx * dx + dz * dz
+            if dist_sq < 1.0:
+                return (dx, dz)  # 极近，直接朝它
+            w = 1.0 / dist_sq  # 1/dist² 衰减
+            total_dx += dx * w
+            total_dz += dz * w
+        return (total_dx, total_dz)
+
+    def _water_safe_heading(self, universe, heading):
+        """给定目标 heading，若前方落水则偏转找沿岸方向（不朝海里走）。
+
+        沿 heading 探测前方 PROBE_DIST 格，若任一格是海，
+        依次尝试 ±30°/60°/90°/120°/150° 偏转，取第一个前方全陆地的方向。
+        全失败则返回原 heading（走到海边再被避水逻辑拦住）。
+        """
+        cfg = self.scout_cfg or gamedata.STANDARD_SCOUT
+        probe = cfg.get("probe_dist", 4)
+        cx, cz = math.floor(self.position[0]), math.floor(self.position[2])
+
+        def direction_clear(h):
+            dx = math.cos(h)
+            dz = math.sin(h)
+            for s in range(1, probe + 1):
+                ix = cx + int(round(dx * s))
+                iz = cz + int(round(dz * s))
+                if not universe._is_land_pure(ix, iz):
+                    return False
+            return True
+
+        if direction_clear(heading):
+            return heading
+        for deg in (30, 60, 90, 120, 150, -30, -60, -90, -120, -150):
+            rad = math.radians(deg)
+            h2 = heading + rad
+            if direction_clear(h2):
+                return h2
+        return heading
+
+    def _update_scout_wander(self, dt, universe, towers, base):
+        """侦察怪游荡：噪音导向移动，感知塔/大本营后带消息回巢。
+
+        噪音源 = 塔 + 大本营。距离越近噪音越大（1/dist² 衰减）。
+        换向时 heading 偏向噪音方向 + 随机扰动，非纯随机。
+        """
+        cfg = self.scout_cfg or gamedata.STANDARD_SCOUT
+        turn_interval = cfg.get("turn_interval", 1.2)
+        noise_jitter = cfg.get("noise_jitter", 0.5)
+        wander_turn = cfg.get("wander_turn", 1.0)
+        # 换向计时
+        self.wander_turn_timer -= dt
+        if self.wander_turn_timer <= 0:
+            noise = self._noise_direction(towers, base)
+            if noise and (noise[0] or noise[1]):
+                # 噪音导向：heading 偏向噪音源 + 扰动，再避水偏转
+                noise_heading = math.atan2(noise[1], noise[0])
+                raw_heading = noise_heading + random.uniform(
+                    -noise_jitter, noise_jitter)
+                self.wander_heading = self._water_safe_heading(
+                    universe, raw_heading)
+            else:
+                # 无噪音源：纯随机 + 避水
+                raw_heading = self.wander_heading + random.uniform(
+                    -wander_turn, wander_turn)
+                self.wander_heading = self._water_safe_heading(
+                    universe, raw_heading)
+            self.wander_turn_timer = turn_interval
+
+        # 沿 heading 移动
+        terrain_speed = self._get_terrain_speed(universe)
+        speed = self.speed * self.slow_factor * terrain_speed * dt
+        nx = self.position[0] + math.cos(self.wander_heading) * speed
+        nz = self.position[2] + math.sin(self.wander_heading) * speed
+
+        # 避免走入海洋：目标格不是陆地则跳过本步（纯噪声，卸载区也正确）
+        cell_x, cell_z = math.floor(nx), math.floor(nz)
+        if universe._is_land_pure(cell_x, cell_z):
+            self.position[0] = nx
+            self.position[2] = nz
+
+        self._sync_y(dt, universe)
+
+        # 感知检查：塔 + 大本营
+        perception = cfg.get("perception_radius", 20.0)
+        perception_sq = perception * perception
+        found = False
+        if base:
+            bd = ((self.position[0] - base.position[0]) ** 2 +
+                  (self.position[2] - base.position[2]) ** 2)
+            if bd < perception_sq:
+                found = True
+        if not found and towers:
+            for tower in towers:
+                td = ((self.position[0] - tower.position[0]) ** 2 +
+                      (self.position[2] - tower.position[2]) ** 2)
+                if td < perception_sq:
+                    found = True
+                    break
+
+        if found:
+            self.has_message = True
+            self._start_return(universe)
+            return None
+
+        # 超时检查
+        self.wander_lifetime -= dt
+        if self.wander_lifetime <= 0:
+            self._start_return(universe)
+            return None
+
+        return None
+
+    def _start_return(self, universe):
+        """开始回巢：生成从当前位置到 home 刷怪点的路径。"""
+        spawner = universe.spawners[self.home_spawner_id]
+        dx = self.position[0] - (spawner.x + 0.5)
+        dz = self.position[2] - (spawner.z + 0.5)
+        if dx * dx + dz * dz < 2.0:
+            # 已在 home 附近，直接消失
+            self.active = False
+            self.scout_returned_with_message = self.has_message
+            return
+        path_points = universe._generate_path(
+            math.floor(self.position[0]), math.floor(self.position[2]),
+            spawner.x, spawner.z,
+            self.home_spawner_id * 100 + 7,
+            universe.seed + 777 + self.home_spawner_id * 333)
+        self.return_path = tuple(path_points) if path_points else ()
+        self.return_path_index = 0
+        self.behavior = "scout_return"
+
+    def _update_scout_return(self, dt, universe):
+        """侦察怪回巢：沿路径回到刷怪点，到达后消失。"""
+        if self.return_path_index >= len(self.return_path):
+            self.active = False
+            self.scout_returned_with_message = self.has_message
+            return None
+
+        target = self.return_path[self.return_path_index]
+        dx = target[0] - self.position[0]
+        dz = target[2] - self.position[2]
+        dist_sq = dx * dx + dz * dz
+
+        if dist_sq < 0.25:
+            self.return_path_index += 1
+            if self.return_path_index >= len(self.return_path):
+                self.active = False
+                self.scout_returned_with_message = self.has_message
+                return None
+        else:
+            dist_xz = dist_sq ** 0.5
+            speed = self.speed * self.slow_factor * dt
+            inv_dist = speed / dist_xz
+            self.position[0] += dx * inv_dist
+            self.position[2] += dz * inv_dist
+
+        self._sync_y(dt, universe)
         return None
 
     def _get_terrain_speed(self, universe):

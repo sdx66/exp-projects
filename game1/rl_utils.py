@@ -17,6 +17,7 @@ raylib 6.x 使用 cffi 绑定，结构体通过 tuple 直接传入（不解包�
 
 import os
 import platform
+import math
 
 import raylib as rl
 
@@ -223,8 +224,30 @@ def draw_circle_v(center, radius, c):
 
 
 def draw_circle_3d(center, radius, c):
-    """地面圆环（3D，XZ 平面）- 绕 X 轴转 90°"""
+    """地面圆盘（3D，XZ 平面）- 绕 X 轴转 90°"""
     rl.DrawCircle3D(center, radius, vec3(1, 0, 0), 90.0, c)
+
+
+def draw_ring_3d(center, radius, c, seg=None):
+    """地面细圆环（3D，XZ 平面，方块链）。
+
+    只描边、不填充圈内，避免大范围半透明绿盘遮盖圈内的掉落物/敌人/塔。
+    seg 越大环越圆滑、方块越小；默认按半径自适应，厚度≈0.8 世界单位。
+    """
+    cx, cy, cz = center
+    if seg is None:
+        seg = max(24, int(radius * 8))
+    step = radius * 2.0 * math.pi / seg   # 弧长≈相邻块间距，首尾相接成环
+    for i in range(seg):
+        a = i / seg * math.tau
+        x = cx + math.cos(a) * radius
+        z = cz + math.sin(a) * radius
+        draw_cube((x, cy, z), step, 0.06, step, c)
+
+
+def draw_circle_lines_v(center, radius, c):
+    """屏幕平面圆环线（2D）— 只描边不填充"""
+    rl.DrawCircleLinesV(center, radius, c)
 
 
 def draw_circle(x, y, radius, c):

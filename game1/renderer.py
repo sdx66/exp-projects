@@ -5,6 +5,7 @@ import random
 import array
 import raylib as rl
 import config
+import gamedata
 from blocks import get_block, is_solid, BLOCK_ID
 from biomes import BIOMES
 from items import MATERIAL_COLORS, WEAPON_TYPES
@@ -56,7 +57,7 @@ class Renderer:
         self._terrain_chunk_key = None
         self._built_key = None
         self._last_biome = None
-        self._path_mesh = None
+        self._path_meshes: dict = {}   # spawner_id -> mesh_arr（逐路径增量烘焙，避免全量重建卡死）
         self._path_key = None
         self._last_visible = None
         self._prop_meshes: dict = {}
@@ -125,6 +126,7 @@ class Renderer:
         self._render_base_3d(universe, camera)
         if entities:
             self._render_entities_3d(entities)
+            self._render_spawners_3d(universe, entities)
             self._render_pickups_3d(entities)
         self._render_path_3d(universe)
         self._render_weather(camera, universe)
@@ -516,6 +518,7 @@ class Renderer:
 
     def _unload_terrain_mesh(self):
         """ """
+        self._unload_path_meshes()
         for key in list(self._chunk_meshes.keys()):
             self._unload_chunk_mesh(key)
         for key in list(self._prop_meshes.keys()):
@@ -608,11 +611,12 @@ class Renderer:
             tc = tower.display_color
             pos = tower.position
             draw_cube((pos[0], pos[1], pos[2]), 0.5, 1.0, 0.5, tc)
-            # Range indicator (faint circle on ground)
-            draw_cube((pos[0], pos[1] - 0.05, pos[2]), tower.range * 2, 0.05, tower.range * 2, (100, 200, 100, 30))
 
         for enemy in entities.get("enemies", []):
-            ec = (*config.ENEMY_COLORS.get(enemy.type_name, (200, 50, 50)), 255)
+            if enemy.behavior in ("scout_wander", "scout_return"):
+                ec = (100, 150, 255, 255)
+            else:
+                ec = (*gamedata.ENEMY_COLORS.get(enemy.type_name, (200, 50, 50)), 255)
             pos = enemy.position
             draw_cube((pos[0], pos[1], pos[2]), 0.4, 0.6, 0.4, ec)
             # Health bar above enemy
@@ -629,6 +633,45 @@ class Renderer:
             if proj.active:
                 pos = proj.position
                 draw_cube((pos[0], pos[1], pos[2]), 0.15, 0.15, 0.15, projectile_color)
+
+    def _render_spawners_3d(self, universe, entities):
+        """刷怪点 3D 标记：颜色区分休眠/侦察/激活状态。"""
+        spawners = entities.get("spawners", [])
+        if not spawners:
+            return
+        mode_colors = {
+            "dormant": (120, 120, 120, 200),
+            "scouting": (255, 220, 0, 200),
+            "active": (255, 50, 50, 200),
+        }
+        for rt, sp in spawners:
+            cx, cz = sp.x + 0.5, sp.z + 0.5
+            cy = sp.surface_y + 1
+            c = mode_colors.get(rt.mode, (120, 120, 120, 200))
+            # 底座方块
+            draw_cube((cx, cy, cz), 0.8, 0.1, 0.8, c)
+            # 状态光柱
+            if rt.mode == "active":
+                draw_cube((cx, cy + 0.5, cz), 0.2, 1.0, 0.2, (*c[:3], 80))
+            elif rt.mode == "scouting":
+                draw_cube((cx, cy + 0.3, cz), 0.15, 0.6, 0.15, (*c[:3], 60))
+
+    def _render_spawners_2d(self, universe, entities):
+        """刷怪点 2D 标记。"""
+        spawners = entities.get("spawners", [])
+        if not spawners:
+            return
+        mode_colors = {
+            "dormant": (120, 120, 120, 200),
+            "scouting": (255, 220, 0, 200),
+            "active": (255, 50, 50, 200),
+        }
+        for rt, sp in spawners:
+            cx, cz = sp.x + 0.5, sp.z + 0.5
+            c = mode_colors.get(rt.mode, (120, 120, 120, 200))
+            draw_circle_v((cx, cz), 0.4, c)
+            if rt.mode == "active":
+                draw_circle_v((cx, cz), 0.6, (*c[:3], 60))
 
     def _render_pickups_3d(self, entities):
         """ """
@@ -648,44 +691,40 @@ class Renderer:
             draw_cube((px, float_y, pz), 0.2, 0.2, 0.2, (*c, 255))
             draw_cube((px, float_y, pz), 0.35, 0.35, 0.35, (*c, 60))
 
-    def _build_path_mesh(self, universe):
-        """Bake all enemy paths into a single static mesh"""
-        if self._path_mesh:
-            rl.UnloadMesh(self._path_mesh)
-            self._path_mesh = None
+    def _build_single_path_mesh(self, pd):
+        """把单个路径烘成静态网格。
 
-        material = self._get_shared_material()
+        路径点已带表面锚定 y（= 地表方块顶面 +1），段内位置/高度线性插值，
+        不再逐点重算 fbm 地形（原 _build_path_mesh 每个路径点重算一次地形，
+        全量重建时随总路径点线性恶化，是游戏后期单帧 1-2 秒卡死的根因）。
+        """
+        points = pd.points
+        if len(points) < 2:
+            return None
         positions = array.array('f')
         colors = array.array('B')
 
-        for path in universe.enemy_paths:
-            points = path.points
-            for i in range(len(points) - 1):
-                p1 = points[i]
-                p2 = points[i + 1]
-                x1, y1, z1 = p1
-                x2, y2, z2 = p2
-                dx = x2 - x1
-                dz = z2 - z1
-                seg_len = math.sqrt(dx * dx + dz * dz)
-                steps = max(1, int(seg_len))
-                for s in range(steps):
-                    t = s / steps
-                    # 路径点已是世界坐标（方块中心），不再额外 +0.5
-                    x = x1 + dx * t
-                    z = z1 + dz * t
-                    # surface_y 是地表方块的 y 索引，方块顶面在 +1；再抬 0.05 避免贴地 z-fighting
-                    y = universe.get_surface_height(math.floor(x - 0.5), math.floor(z - 0.5)) + 1.05
-                    # 完整四边形（两个三角形覆盖整块）
-                    for dx_c, dy_c, dz_c in [
-                        (-0.45, 0, -0.45), (0.45, 0, 0.45), (0.45, 0, -0.45),
-                        (-0.45, 0, -0.45), (-0.45, 0, 0.45), (0.45, 0, 0.45),
-                    ]:
-                        positions.extend((x + dx_c, y + dy_c + 0.1, z + dz_c))
-                        colors.extend((180, 160, 120, 255))
-
-        if not positions:
-            return
+        for i in range(len(points) - 1):
+            x1, y1, z1 = points[i]
+            x2, y2, z2 = points[i + 1]
+            dx = x2 - x1
+            dz = z2 - z1
+            seg_len = math.sqrt(dx * dx + dz * dz)
+            steps = max(1, int(seg_len))
+            for s in range(steps):
+                t = s / steps
+                # 路径点已是世界坐标（方块中心），x/z 不再 +0.5；
+                # y 线性插值保持连续，再抬 0.05 避免贴地 z-fighting
+                x = x1 + dx * t
+                z = z1 + dz * t
+                y = y1 + (y2 - y1) * t + 0.05
+                # 完整四边形（两个三角形覆盖整块）
+                for dx_c, dy_c, dz_c in [
+                    (-0.45, 0, -0.45), (0.45, 0, 0.45), (0.45, 0, -0.45),
+                    (-0.45, 0, -0.45), (-0.45, 0, 0.45), (0.45, 0, 0.45),
+                ]:
+                    positions.extend((x + dx_c, y + dy_c + 0.1, z + dz_c))
+                    colors.extend((180, 160, 120, 255))
 
         mesh_arr = rl.ffi.new("struct Mesh[]", 1)
         mesh = mesh_arr[0]
@@ -713,15 +752,46 @@ class Renderer:
         mesh.vertices = rl.ffi.NULL
         mesh.colors = rl.ffi.NULL
         mesh.indices = rl.ffi.NULL
-        self._path_mesh = mesh_arr[0]
-        self._path_key = len(universe.enemy_paths)
+        return mesh_arr
+
+    def _sync_path_meshes(self, universe):
+        """增量同步路径网格：只烘焙新增路径，逐路径缓存。
+
+        原 _build_path_mesh 在路径数变化时整包重建（每个路径点还重算 fbm
+        地形），而 enemy_paths 随游戏只增不减 → 后期单帧烘焙 1-2 秒、整窗
+        卡死。此函数把成本摊到各路径首次出现的帧（单路径 ~10-30ms）。
+        """
+        desired = universe.enemy_paths
+        meshes = self._path_meshes
+        # 删除已消失的路径网格（存档替换 universe 等情况）
+        for sid in list(meshes):
+            if sid not in desired:
+                rl.UnloadMesh(meshes.pop(sid)[0])
+        # 只烘新增路径；每帧限烘焙预算，批量新增（如载入存档后首帧）也摊帧
+        baked = 0
+        for sid, pd in desired.items():
+            if sid in meshes:
+                continue
+            m = self._build_single_path_mesh(pd)
+            if m is not None:
+                meshes[sid] = m
+            baked += 1
+            if baked >= 24:
+                break
 
     def _render_path_3d(self, universe):
-        """Draw baked path mesh"""
-        if len(universe.enemy_paths) != self._path_key:
-            self._build_path_mesh(universe)
-        if self._path_mesh:
-            rl.DrawMesh(self._path_mesh, self._get_shared_material(), self._IDENTITY_MATRIX)
+        """逐路径网格绘制（增量缓存，路径数变化不卡帧）"""
+        self._sync_path_meshes(universe)
+        material = self._get_shared_material()
+        for entry in self._path_meshes.values():
+            rl.DrawMesh(entry[0], material, self._IDENTITY_MATRIX)
+
+    def _unload_path_meshes(self):
+        """卸载全部路径网格。"""
+        for entry in list(self._path_meshes.values()):
+            rl.UnloadMesh(entry[0])
+        self._path_meshes.clear()
+        self._path_key = None
 
     def _render_base_2d(self, universe, camera):
         """ """
@@ -746,6 +816,7 @@ class Renderer:
         self._render_path_2d(universe)
         if entities:
             self._render_entities_2d(entities)
+            self._render_spawners_2d(universe, entities)
         self._render_weather(camera, universe)
         if camera_extra:
             camera_extra()
@@ -834,7 +905,7 @@ class Renderer:
         if cache_key != self._2d_path_key:
             path_color = (255, 200, 50, 102)
             cached = []
-            for path_data in universe.enemy_paths:
+            for path_data in universe.enemy_paths.values():
                 for x, y, z in path_data.points:
                     # 0.4 宽格子，x/z 已是世界坐标（方块中心），故 -0.2 对齐
                     cached.append(((x - 0.2, z - 0.2), path_color))
@@ -853,10 +924,12 @@ class Renderer:
             tc = tower.display_color
             pos = (tower.position[0], tower.position[2])
             draw_circle_v(pos, 0.3, tc)
-            draw_circle_v(pos, tower.range, (100, 200, 100, 51))
 
         for enemy in entities.get("enemies", []):
-            ec = (*config.ENEMY_COLORS.get(enemy.type_name, (200, 50, 50)), 255)
+            if enemy.behavior in ("scout_wander", "scout_return"):
+                ec = (100, 150, 255, 255)
+            else:
+                ec = (*gamedata.ENEMY_COLORS.get(enemy.type_name, (200, 50, 50)), 255)
             draw_circle_v((enemy.position[0], enemy.position[2]), 0.25, ec)
             bar_w = 0.6
             bar_h = 0.1

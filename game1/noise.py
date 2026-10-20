@@ -19,15 +19,19 @@ UINT32_MAX = np.uint64(0xFFFFFFFF)
 
 
 def _hash_2d(x: int, y: int, seed: int) -> float:
-    """2D 哈希 → [0, 1)，带格点 FIFO 缓存（标量版）"""
+    """2D 哈希 → [0, 1)，带格点 FIFO 缓存（标量版）
+
+    与 _hash_2d_vec 逐位一致：每步 & 0xFFFFFFFF（32 位掩码）。
+    """
     key = (x, y, seed)
     cached = _hash_cache.get(key)
     if cached is not None:
         return cached
-    h = x * 374761393 + y * 668265263 + seed * 1442695040
-    h = (h ^ (h >> 13)) * 1274126177
-    h = h ^ (h >> 16)
-    result = (h & 0xFFFFFFFF) / 0xFFFFFFFF
+    s = seed & 0xFFFFFFFF
+    h = (x * 374761393 + y * 668265263 + s * 1442695040) & 0xFFFFFFFF
+    h = ((h ^ (h >> 13)) * 1274126177) & 0xFFFFFFFF
+    h = (h ^ (h >> 16)) & 0xFFFFFFFF
+    result = h / 0xFFFFFFFF
     _hash_cache[key] = result
     if len(_hash_cache) > _HASH_CACHE_MAX:
         _hash_cache.pop(next(iter(_hash_cache)))
@@ -55,11 +59,16 @@ def _hash_2d_vec(ix, iy, seed):
 
 
 def _hash_3d(x: int, y: int, z: int, seed: int) -> float:
-    """3D 哈希 → [0, 1) — 备用，当前未使用"""
-    h = x * 374761393 + y * 668265263 + z * 2246822519 + seed * 1442695040
-    h = (h ^ (h >> 13)) * 1274126177
-    h = h ^ (h >> 16)
-    return (h & 0xFFFFFFFF) / 0xFFFFFFFF
+    """3D 哈希 → [0, 1) — 备用，当前未使用
+
+    与 _hash_2d 逐位一致：每步 & 0xFFFFFFFF。
+    """
+    s = seed & 0xFFFFFFFF
+    h = (x * 374761393 + y * 668265263 + z * 2246822519
+         + s * 1442695040) & 0xFFFFFFFF
+    h = ((h ^ (h >> 13)) * 1274126177) & 0xFFFFFFFF
+    h = (h ^ (h >> 16)) & 0xFFFFFFFF
+    return h / 0xFFFFFFFF
 
 
 # ─── 平滑插值 ──────────────────────────────────────────────

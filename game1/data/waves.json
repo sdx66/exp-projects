@@ -1,0 +1,24 @@
+{
+  "comment": "波次构成数据。运行时由 gamedata.py 读取，game._init_spawner_wave 使用。\nfallback: 表中未列出的波次用公式 count = base_count + wave*count_per_wave，\nenemy_types_default 为默认敌人类别列表；其余为公共参数。\nwaves: 显式逐波覆盖（count/enemy_types），未给字段时取 fallback。",
+  "fallback": {
+    "base_count": 5,
+    "count_per_wave": 2,
+    "enemy_types_default": ["regular", "fast", "tank"],
+    "interval_base": 0.8,
+    "interval_min": 0.2,
+    "interval_decay": 0.05,
+    "bonus_base": 50,
+    "bonus_per_wave": 10,
+    "score_per_wave": 100
+  },
+  "waves": [
+    {"wave": 1, "count": 7, "enemy_types": ["regular"]},
+    {"wave": 2, "count": 9, "enemy_types": ["regular"]},
+    {"wave": 3, "count": 11, "enemy_types": ["regular", "fast"]},
+    {"wave": 4, "count": 13, "enemy_types": ["regular", "fast"]},
+    {"wave": 5, "count": 15, "enemy_types": ["regular", "fast", "tank"]},
+    {"wave": 6, "count": 17, "enemy_types": ["regular", "fast", "tank"]},
+    {"wave": 7, "count": 19, "enemy_types": ["regular", "fast", "tank"]},
+    {"wave": 8, "count": 21, "enemy_types": ["regular", "fast", "tank"]}
+  ]
+}

@@ -1,0 +1,44 @@
+{
+  "comment": "敌人数据。运行时由 gamedata.py 读取并构建 entities.ENEMY_TYPES / 掉落表 / 地形速度。\nglobal: 跨类型的全局参数。types: 每类 base_health/base_speed/base_reward + color + personality + drops[[材料,数量],...]。\nterrain_speed: 各生物群系对敌人速度的倍率。",
+  "global": {
+    "base_damage": 5,
+    "health_growth": 1.08,
+    "speed_growth": 0.0,
+    "reward_growth": 0.1
+  },
+  "terrain_speed": {
+    "plains": 1.25,
+    "forest": 1.0,
+    "mountain": 0.6,
+    "ocean": 0.4,
+    "desert": 1.15,
+    "tundra": 0.85,
+    "savanna": 1.1
+  },
+  "types": {
+    "regular": {
+      "base_health": 25,
+      "base_speed": 2.0,
+      "base_reward": 10,
+      "color": [180, 60, 60],
+      "personality": {"direct": 0.5, "terrain_aware": 0.5, "aggressive": 0.5, "wobble": 0.5},
+      "drops": [["wood", 2], ["stone", 2], ["hide", 1]]
+    },
+    "fast": {
+      "base_health": 15,
+      "base_speed": 4.0,
+      "base_reward": 8,
+      "color": [220, 150, 40],
+      "personality": {"direct": 0.9, "terrain_aware": 0.2, "aggressive": 0.8, "wobble": 0.8},
+      "drops": [["sand", 1], ["wood", 1], ["fat", 1]]
+    },
+    "tank": {
+      "base_health": 75,
+      "base_speed": 1.0,
+      "base_reward": 25,
+      "color": [100, 80, 160],
+      "personality": {"direct": 0.2, "terrain_aware": 0.9, "aggressive": 0.3, "wobble": 0.3},
+      "drops": [["iron_ore", 1], ["copper_ore", 1], ["stone", 3], ["bone", 1], ["hide", 2]]
+    }
+  }
+}

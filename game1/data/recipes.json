@@ -1,0 +1,303 @@
+{
+  "comment": "配方与物品数据。运行时由 gamedata.py 读取。\nmaterials: 材料定义 class=raw|processed + color + name_cn。\nprocessing: 加工配方 key=规则名; hand/tool=徒手/工具产量(hand=0 徒手不可),\ntime_hand/time_tool 耗时, requires_tool 必需工具, requires_tech 科技前置。\ntools: 工具合成配方; weapons: 武器合成配方(可装备为塔); 均支持 requires_tech。\ndismantle_refund: 拆塔回收比例。",
+  "dismantle_refund": 0.5,
+  "materials": {
+    "wood": {"class": "raw", "color": [140, 100, 50], "name_cn": "木材"},
+    "stone": {"class": "raw", "color": [145, 145, 145], "name_cn": "石料"},
+    "sand": {"class": "raw", "color": [219, 207, 163], "name_cn": "沙子"},
+    "iron_ore": {"class": "raw", "color": [160, 140, 120], "name_cn": "铁矿石"},
+    "copper_ore": {"class": "raw", "color": [172, 104, 64], "name_cn": "铜矿石"},
+    "hide": {"class": "raw", "color": [150, 110, 70], "name_cn": "兽皮"},
+    "fat": {"class": "raw", "color": [230, 220, 160], "name_cn": "油脂"},
+    "bone": {"class": "raw", "color": [230, 225, 210], "name_cn": "兽骨"},
+    "plank": {"class": "processed", "color": [180, 130, 70], "name_cn": "木板"},
+    "cobble": {"class": "processed", "color": [120, 120, 120], "name_cn": "圆石"},
+    "iron_ingot": {"class": "processed", "color": [200, 200, 210], "name_cn": "铁锭"},
+    "copper": {"class": "processed", "color": [210, 122, 72], "name_cn": "粗铜"},
+    "bronze": {"class": "processed", "color": [172, 122, 62], "name_cn": "青铜"},
+    "rope": {"class": "processed", "color": [160, 130, 80], "name_cn": "绳索"},
+    "glue": {"class": "processed", "color": [180, 140, 60], "name_cn": "胶黏剂"},
+    "bone_ware": {"class": "processed", "color": [235, 230, 215], "name_cn": "骨器"},
+    "bloom": {"class": "processed", "color": [160, 152, 146], "name_cn": "铁块"}
+  },
+  "processing": {
+    "wood->plank": {
+      "in": "wood", "out": "plank",
+      "hand": 1, "tool": 2,
+      "time_hand": 1.0, "time_tool": 0.4,
+      "requires_tool": null,
+      "requires_tech": []
+    },
+    "stone->cobble": {
+      "in": "stone", "out": "cobble",
+      "hand": 1, "tool": 2,
+      "time_hand": 1.2, "time_tool": 0.5,
+      "requires_tool": null,
+      "requires_tech": []
+    },
+    "iron_ore->bloom": {
+      "in": "iron_ore", "out": "bloom",
+      "hand": 0, "tool": 2,
+      "time_hand": null, "time_tool": 1.6,
+      "requires_tool": "bloomery",
+      "requires_tech": ["iron:R2"]
+    },
+    "copper_ore->copper": {
+      "in": "copper_ore", "out": "copper",
+      "hand": 0, "tool": 2,
+      "time_hand": null, "time_tool": 1.4,
+      "requires_tool": "smelter",
+      "requires_tech": ["bronze:Y4"]
+    },
+    "copper->bronze": {
+      "in": "copper", "out": "bronze",
+      "hand": 0, "tool": 1,
+      "time_hand": null, "time_tool": 1.4,
+      "requires_tool": "casting_set",
+      "requires_tech": ["bronze:Z2"]
+    },
+    "bloom->iron_ingot": {
+      "in": "bloom", "out": "iron_ingot",
+      "hand": 0, "tool": 1,
+      "time_hand": null, "time_tool": 1.6,
+      "requires_tool": "forge",
+      "requires_tech": ["iron:U2"]
+    },
+    "hide->rope": {
+      "in": "hide", "out": "rope",
+      "hand": 0, "tool": 2,
+      "time_hand": null, "time_tool": 0.5,
+      "requires_tool": "hafting",
+      "requires_tech": []
+    },
+    "hide->glue": {
+      "in": "hide", "out": "glue",
+      "hand": 0, "tool": 2,
+      "time_hand": null, "time_tool": 0.6,
+      "requires_tool": "mortar",
+      "requires_tech": []
+    },
+    "bone->bone_ware": {
+      "in": "bone", "out": "bone_ware",
+      "hand": 0, "tool": 2,
+      "time_hand": null, "time_tool": 0.7,
+      "requires_tool": "bone_working",
+      "requires_tech": []
+    },
+    "cobble->sand": {
+      "in": "cobble", "out": "sand",
+      "hand": 0, "tool": 2,
+      "time_hand": null, "time_tool": 0.8,
+      "requires_tool": "grindstone",
+      "requires_tech": []
+    }
+  },
+  "tools": {
+    "saw": {
+      "label_cn": "石锯",
+      "recipe": {"plank": 2, "cobble": 2},
+      "applies": "wood->plank",
+      "color": [180, 180, 190],
+      "requires_tech": []
+    },
+    "hammer": {
+      "label_cn": "锤子",
+      "recipe": {"cobble": 2, "plank": 1},
+      "applies": "stone->cobble",
+      "color": [120, 120, 120],
+      "requires_tech": []
+    },
+    "bloomery": {
+      "label_cn": "块炼炉",
+      "recipe": {"cobble": 6, "sand": 2},
+      "applies": "iron_ore->bloom",
+      "color": [150, 130, 110],
+      "requires_tech": ["stone:B40"]
+    },
+    "forge": {
+      "label_cn": "锻造装置",
+      "recipe": {"cobble": 5, "plank": 2, "hide": 1},
+      "applies": "bloom->iron_ingot",
+      "color": [120, 120, 128],
+      "requires_tech": ["iron:U2"]
+    },
+    "hafting": {
+      "label_cn": "装柄·复合工具",
+      "recipe": {"plank": 2, "hide": 1},
+      "applies": "hide->rope",
+      "color": [150, 120, 80],
+      "requires_tech": ["stone:B17"]
+    },
+    "bone_working": {
+      "label_cn": "骨·角·象牙器",
+      "recipe": {"bone": 1, "plank": 1},
+      "applies": "bone->bone_ware",
+      "color": [230, 225, 210],
+      "requires_tech": ["stone:B22"]
+    },
+    "mortar": {
+      "label_cn": "研磨器(杵臼)",
+      "recipe": {"stone": 2, "wood": 1},
+      "applies": "hide->glue",
+      "color": [120, 120, 120],
+      "requires_tech": ["stone:B27"]
+    },
+    "grindstone": {
+      "label_cn": "磨制石器",
+      "recipe": {"cobble": 3},
+      "applies": "cobble->sand",
+      "color": [160, 150, 150],
+      "requires_tech": ["stone:B27"]
+    },
+    "smelter": {
+      "label_cn": "熔炼装置",
+      "recipe": {"cobble": 4, "sand": 2},
+      "applies": "copper_ore->copper",
+      "color": [150, 110, 80],
+      "requires_tech": ["bronze:Y4"]
+    },
+    "casting_set": {
+      "label_cn": "铸造装置",
+      "recipe": {"cobble": 4, "sand": 4},
+      "applies": "copper->bronze",
+      "color": [140, 120, 90],
+      "requires_tech": ["bronze:Z2"]
+    }
+  },
+  "weapons": {
+    "wood_club": {
+      "label_cn": "木棒",
+      "recipe": {"plank": 2},
+      "damage": 8, "range": 3.5, "cooldown": 1.1,
+      "install_fee": 10,
+      "color": [120, 90, 50],
+      "requires_tech": []
+    },
+    "stone_axe": {
+      "label_cn": "石斧",
+      "recipe": {"plank": 1, "cobble": 2},
+      "damage": 14, "range": 4.0, "cooldown": 1.0,
+      "install_fee": 20,
+      "color": [150, 150, 150],
+      "requires_tech": ["stone:B1"]
+    },
+    "iron_sword": {
+      "label_cn": "铁剑",
+      "recipe": {"iron_ingot": 2, "plank": 1},
+      "damage": 24, "range": 5.0, "cooldown": 0.9,
+      "install_fee": 40,
+      "special": {"bonus_vs": "tank", "bonus_mult": 1.5},
+      "color": [200, 200, 210],
+      "requires_tech": ["iron:U6"]
+    },
+    "sand_sling": {
+      "label_cn": "沙弹弓",
+      "recipe": {"sand": 3, "plank": 1},
+      "damage": 6, "range": 3.5, "cooldown": 0.5,
+      "install_fee": 15,
+      "special": {"slow_factor": 0.5, "slow_duration": 1.5},
+      "color": [210, 180, 100],
+      "requires_tech": []
+    },
+    "spear": {
+      "label_cn": "尖木矛",
+      "recipe": {"wood": 2},
+      "damage": 9, "range": 4.0, "cooldown": 1.0,
+      "install_fee": 12,
+      "color": [140, 110, 70],
+      "requires_tech": []
+    },
+    "stone_spear": {
+      "label_cn": "装柄石尖矛",
+      "recipe": {"stone": 2, "plank": 1, "rope": 1},
+      "damage": 13, "range": 4.5, "cooldown": 1.0,
+      "install_fee": 22,
+      "color": [150, 150, 150],
+      "requires_tech": ["stone:B17"]
+    },
+    "atlatl": {
+      "label_cn": "投矛器",
+      "recipe": {"plank": 2, "hide": 1, "rope": 1},
+      "damage": 12, "range": 6.0, "cooldown": 1.2,
+      "install_fee": 25,
+      "color": [160, 130, 80],
+      "requires_tech": ["stone:W3"]
+    },
+    "bow": {
+      "label_cn": "弓",
+      "recipe": {"wood": 2, "rope": 2, "hide": 1},
+      "damage": 10, "range": 7.0, "cooldown": 0.9,
+      "install_fee": 30,
+      "color": [150, 110, 60],
+      "requires_tech": ["stone:W3"]
+    },
+    "bone_hook": {
+      "label_cn": "骨鱼钩",
+      "recipe": {"bone_ware": 2, "rope": 1},
+      "damage": 7, "range": 4.0, "cooldown": 0.7,
+      "install_fee": 12,
+      "special": {"slow_factor": 0.6, "slow_duration": 2.0},
+      "color": [230, 225, 210],
+      "requires_tech": ["stone:B22"]
+    },
+    "fish_net": {
+      "label_cn": "渔网",
+      "recipe": {"rope": 3},
+      "damage": 4, "range": 3.0, "cooldown": 0.8,
+      "install_fee": 18,
+      "special": {"slow_factor": 0.35, "slow_duration": 2.5},
+      "color": [180, 160, 120],
+      "requires_tech": ["stone:W9"]
+    },
+    "snare_trap": {
+      "label_cn": "陷阱",
+      "recipe": {"wood": 2, "rope": 1},
+      "damage": 8, "range": 2.5, "cooldown": 1.0,
+      "install_fee": 15,
+      "special": {"slow_factor": 0.3, "slow_duration": 3.0},
+      "color": [120, 110, 90],
+      "requires_tech": ["stone:W9"]
+    },
+    "metal_spear": {
+      "label_cn": "金属矛",
+      "recipe": {"bronze": 1, "wood": 1, "rope": 1},
+      "damage": 18, "range": 5.0, "cooldown": 0.9,
+      "install_fee": 32,
+      "requires_tech": ["bronze:Z2"],
+      "color": [190, 190, 200]
+    },
+    "short_sword": {
+      "label_cn": "短剑",
+      "recipe": {"bronze": 1, "bone_ware": 1, "plank": 1},
+      "damage": 20, "range": 4.5, "cooldown": 0.9,
+      "install_fee": 35,
+      "requires_tech": ["bronze:Z2"],
+      "color": [200, 200, 215]
+    },
+    "halberd": {
+      "label_cn": "戈戟",
+      "recipe": {"bronze": 2, "plank": 2, "rope": 1},
+      "damage": 26, "range": 5.5, "cooldown": 1.1,
+      "install_fee": 45,
+      "special": {"splash_radius": 1.6, "splash_falloff": 0.6},
+      "requires_tech": ["bronze:Z2"],
+      "color": [205, 205, 215]
+    },
+    "composite_bow": {
+      "label_cn": "复合弓",
+      "recipe": {"plank": 2, "rope": 2, "glue": 2},
+      "damage": 16, "range": 8.0, "cooldown": 1.0,
+      "install_fee": 40,
+      "color": [170, 130, 70],
+      "requires_tech": []
+    },
+    "longbow": {
+      "label_cn": "长弓",
+      "recipe": {"wood": 3, "rope": 2, "hide": 1},
+      "damage": 14, "range": 9.0, "cooldown": 1.0,
+      "install_fee": 35,
+      "color": [140, 100, 55],
+      "requires_tech": ["stone:W3"]
+    }
+  }
+}

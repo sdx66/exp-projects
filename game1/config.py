@@ -1,6 +1,16 @@
 """
 config.py - 全局常量与可调参数
-所有游戏数值集中在此，便于平衡与调试
+
+数值的“唯一事实来源”现在是 data/*.json（由 gamedata.py 在启动时读取）：
+  - 科技树/科技效果   → data/tech.json
+  - 配方/工具/武器/材料 → data/recipes.json
+  - 敌人类型/掉落      → data/enemies.json
+  - 刷怪点种类/侦察兵  → data/spawners.json
+  - 波次构成          → data/waves.json
+  - 塔属性           → data/towers.json
+
+本文件只保留纯工程/渲染常量（窗口、相机、物理、存档版本等）与无法归入
+上述六类的少量数值（初始金钱、升级倍率等）。
 """
 
 # ─── 日志 ──────────────────────────────────────────────────
@@ -24,17 +34,22 @@ RENDER_DISTANCE = 5           # 渲染距离（区块数）
 FOG_NEAR = 50.0               # 雾起始距离（世界单位，≥相机距离42保证焦点清晰）
 FOG_FAR = 110.0               # 雾完全遮挡距离（≈眼位到地块边缘，满雾压边）
 FOG_DENSITY = 0.018           # 全局雾密度（备用）
-MAX_LOADED_CHUNKS = 180       # LRU 上限（RENDER_DISTANCE=5 需要 ~80 个，留 2 倍余量）
+MAX_LOADED_CHUNKS = 240       # LRU 上限（RENDER_DISTANCE=5 需要 ~80 个，留约 3 倍余量供按需重载）
 
 # ─── 大本营 ──────────────────────────────────────────────────
 BASE_HEALTH = 100             # 大本营最大生命值
 BASE_RADIUS = 3.0             # 大本营半径
-ENEMY_BASE_DAMAGE = 5         # 敌人到达大本营造成的伤害
-ENEMY_SPAWN_DISTANCE_MIN = 28  # 刷怪点最小距离
-ENEMY_SPAWN_DISTANCE_MAX = 42  # 刷怪点最大距离
+# 敌人到达大本营的伤害见 data/enemies.json -> global.base_damage
 
 # ─── 种子 ──────────────────────────────────────────────────
 DEFAULT_SEED = 42      # 默认种子
+
+# ─── 存档 ──────────────────────────────────────────────────
+# 存档文件格式版本。反序列化按此做迁移；未知字段一律 .get() 兜底。
+# v1→v2: 新增 per-spawner 运行时状态 + 侦察怪；旧全局波次映射到最近激活点。
+# v2→v3: 粗格编码 spawner id + enemy_paths dict by spawner_id。
+# v3→v4: 科技树 v2 数据（263 成果 + 770 突破点，5 时代），旧 12 科技 ID 别名映射。
+SAVE_VERSION = 4
 
 # ─── 相机 ──────────────────────────────────────────────────
 CAMERA_DISTANCE_MIN = 10.0
@@ -47,31 +62,17 @@ CAMERA_ZOOM_SPEED = 0.002
 CAMERA_2D_ZOOM_MIN = 0.3
 CAMERA_2D_ZOOM_MAX = 3.0
 
-# ─── 实体 ──────────────────────────────────────────────────
+# ─── 实体（升级曲线等通用参数） ─────────────────────────────
+# 塔的基础属性见 data/towers.json；敌人基础属性见 data/enemies.json
 TOWER_DAMAGE_MULT = 1.5      # 每级强化伤害倍率增量（1.0=不生效，升级形同虚设）
 TOWER_RANGE_MULT = 1.1       # 每级强化射程倍率增量（1.0=不生效）
 TOWER_COOLDOWN_MULT = 0.9    # 每级强化冷却倍率（越小越快）
 MAX_TOWER_LEVEL = 3
 UPGRADE_COST_MULT = 1.5      # 升级费用每级倍率
 
-# 敌人波次增长
-ENEMY_HEALTH_GROWTH = 1.08   # 每波健康增长（指数倍率，见 game.py:159）
-ENEMY_SPEED_GROWTH = 0.0     # 每波速度增长；1.03 会导致波2 即 2 倍速，直接毁掉难度曲线
-
 # 初始金钱与生命
 STARTING_MONEY = 200
 STARTING_LIVES = 20
-
-# ─── 波次与经济 ────────────────────────────────────────────
-WAVE_BASE_COUNT = 5          # 基础敌人数量
-WAVE_COUNT_PER_WAVE = 2      # 每波增加数
-WAVE_SPAWN_INTERVAL_BASE = 0.8
-WAVE_SPAWN_INTERVAL_MIN = 0.2
-WAVE_SPAWN_INTERVAL_DECAY = 0.05
-ENEMY_REWARD_GROWTH = 0.1    # 奖励 = base*(1+wave*此值)
-WAVE_BONUS_BASE = 50
-WAVE_BONUS_PER_WAVE = 10
-SCORE_PER_WAVE = 100
 
 # ─── 物理 ──────────────────────────────────────────────────
 PROJECTILE_SPEED = 15.0
@@ -92,53 +93,3 @@ SNOW_PARTICLE_COUNT = 60
 # ─── 渲染 ──────────────────────────────────────────────────
 TEXTURE_SIZE = 64            # 动态纹理分辨率
 ATLAS_SIZE = 4               # 纹理图集尺寸 (ATLAS_SIZE x ATLAS_SIZE 方块)
-
-# ─── 塔类型 ──────────────────────────────────────────────────
-# 塔定义在 entities.py 中，此处仅放颜色
-TOWER_COLORS = {
-    "stone_thrower":  (150, 150, 150),
-    "water_cannon":   (70, 130, 220),
-    "sand_trap":      (210, 180, 100),
-    "metal_tower":    (180, 180, 190),
-}
-
-# ─── 敌人类型 ──────────────────────────────────────────────────
-ENEMY_COLORS = {
-    "regular": (180, 60, 60),
-    "fast":    (220, 150, 40),
-    "tank":    (100, 80, 160),
-}
-
-# ─── 科技树 ─────────────────────────────────────────────────────
-# 每项科技: cost=研究费用, time=研究耗时(秒), requires=前置科技,
-# effect=效果键(见 game.py:TECH_EFFECTS)
-# 前置链: handcraft → stone_mining → {biomass_energy, metallurgy}
-#                                   biomass_energy → water_mechanics
-TECH_TREE = {
-    "handcraft": {
-        "cost": 100, "time": 15.0, "requires": (),
-        "effect": "tower_damage",
-    },
-    "stone_mining": {
-        "cost": 150, "time": 20.0, "requires": ("handcraft",),
-        "effect": "build_cost",
-    },
-    "biomass_energy": {
-        "cost": 200, "time": 25.0, "requires": ("stone_mining",),
-        "effect": None,
-    },
-    "water_mechanics": {
-        "cost": 250, "time": 30.0, "requires": ("biomass_energy",),
-        "effect": None,
-    },
-    "metallurgy": {
-        "cost": 300, "time": 35.0, "requires": ("stone_mining",),
-        "effect": None,
-    },
-}
-
-# 科技数值效果
-TECH_EFFECTS = {
-    "tower_damage": 1.10,   # 塔伤害倍率
-    "build_cost": 0.85,     # 建造费用倍率
-}

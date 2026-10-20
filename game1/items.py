@@ -1,67 +1,37 @@
 """
 items.py - 材料/背包/加工/工具/武器定义
 材料驱动加工链：原料→精炼→武器/工具
+
+所有配方/材料定义来自 data/recipes.json（经 gamedata 加载），见 gamedata.py。
 """
 
 from dataclasses import dataclass, field
 from typing import Optional
 
+import gamedata
 
-# ─── 材料定义 ──────────────────────────────────────────────
 
-RAW = {"wood", "stone", "sand", "iron_ore"}
-PROCESSED = {"plank", "cobble", "iron_ingot"}
+# ─── 材料定义（来自 data/recipes.json） ────────────────────
+
+RAW = gamedata.RAW
+PROCESSED = gamedata.PROCESSED
 ALL_MATERIALS = RAW | PROCESSED
 
-# 材料颜色（用于 HUD/渲染）
-MATERIAL_COLORS = {
-    "wood": (140, 100, 50),
-    "stone": (145, 145, 145),
-    "sand": (219, 207, 163),
-    "iron_ore": (160, 140, 120),
-    "plank": (180, 130, 70),
-    "cobble": (120, 120, 120),
-    "iron_ingot": (200, 200, 210),
-}
-
-MATERIAL_NAMES_CN = {
-    "wood": "木材",
-    "stone": "石料",
-    "sand": "沙子",
-    "iron_ore": "铁矿石",
-    "plank": "木板",
-    "cobble": "圆石",
-    "iron_ingot": "铁锭",
-}
+# 材料颜色/中文名（用于 HUD/渲染）
+MATERIAL_COLORS = gamedata.MATERIAL_COLORS
+MATERIAL_NAMES_CN = gamedata.MATERIAL_NAMES_CN
 
 
-# ─── 加工配方 ──────────────────────────────────────────────
+# ─── 加工配方（来自 data/recipes.json） ─────────────────────
 # 手：消耗 1 原料 → 产物按 hand 产量
 # 工具：消耗 1 原料 → 产物按 tool 产量，更快；某些加工必须有工具
-# hand=0 表示徒手不可（如炼铁需熔炉）
+# hand=0 表示徒手不可（如炼铁需熔炉）；requires_tech 为科技前置
 
-PROCESS_RECIPES = {
-    "wood->plank": {
-        "in": "wood", "out": "plank",
-        "hand": 1, "tool": 2,
-        "time_hand": 1.0, "time_tool": 0.4,
-    },
-    "stone->cobble": {
-        "in": "stone", "out": "cobble",
-        "hand": 1, "tool": 2,
-        "time_hand": 1.2, "time_tool": 0.5,
-    },
-    "iron_ore->ingot": {
-        "in": "iron_ore", "out": "iron_ingot",
-        "hand": 0, "tool": 1,
-        "time_hand": None, "time_tool": 1.5,
-        "requires_tool": "furnace",
-    },
-}
+PROCESS_RECIPES = gamedata.PROCESS_RECIPES
 
 
-# ─── 工具定义 ──────────────────────────────────────────────
-# 工具：一次性合成、永久持有
+# ─── 工具定义（来自 data/recipes.json） ─────────────────────
+# 工具：一次性合成、永久持有；requires_tech 为科技前置
 
 @dataclass(frozen=True)
 class ToolDef:
@@ -70,32 +40,24 @@ class ToolDef:
     recipe: dict          # 合成配方 {material: amount}
     applies: str          # 适用的加工配方键
     color: tuple
+    requires_tech: tuple = ()
 
 
 TOOL_TYPES: dict = {
-    "saw": ToolDef(
-        "saw", "锯子",
-        recipe={"plank": 2, "iron_ingot": 1},
-        applies="wood->plank",
-        color=(180, 180, 190),
-    ),
-    "hammer": ToolDef(
-        "hammer", "锤子",
-        recipe={"cobble": 2, "plank": 1},
-        applies="stone->cobble",
-        color=(120, 120, 120),
-    ),
-    "furnace": ToolDef(
-        "furnace", "熔炉",
-        recipe={"cobble": 4},
-        applies="iron_ore->ingot",
-        color=(180, 100, 50),
-    ),
+    name: ToolDef(
+        name,
+        d["label_cn"],
+        dict(d["recipe"]),
+        d["applies"],
+        tuple(d["color"]),
+        tuple(d.get("requires_tech", [])),
+    )
+    for name, d in gamedata.TOOLS_RAW.items()
 }
 
 
-# ─── 武器定义 ──────────────────────────────────────────────
-# 武器：合成后存入背包，可"装备放置"为塔
+# ─── 武器定义（来自 data/recipes.json） ─────────────────────
+# 武器：合成后存入背包，可"装备放置"为塔；requires_tech 为科技前置
 
 @dataclass(frozen=True)
 class WeaponDef:
@@ -108,53 +70,32 @@ class WeaponDef:
     install_fee: int      # 金钱：武器→塔安装费
     special: dict = field(default_factory=dict)
     color: tuple = (128, 128, 128)
+    requires_tech: tuple = ()
 
 
 WEAPON_TYPES: dict = {
-    "wood_club": WeaponDef(
-        "wood_club", "木棒",
-        recipe={"plank": 2},
-        damage=8, range=3.5, cooldown=1.1,
-        install_fee=10,
-        color=(120, 90, 50),
-    ),
-    "stone_axe": WeaponDef(
-        "stone_axe", "石斧",
-        recipe={"plank": 1, "cobble": 2},
-        damage=14, range=4.0, cooldown=1.0,
-        install_fee=20,
-        color=(150, 150, 150),
-    ),
-    "iron_sword": WeaponDef(
-        "iron_sword", "铁剑",
-        recipe={"iron_ingot": 2, "plank": 1},
-        damage=24, range=5.0, cooldown=0.9,
-        install_fee=40,
-        special={"bonus_vs": "tank", "bonus_mult": 1.5},
-        color=(200, 200, 210),
-    ),
-    "sand_sling": WeaponDef(
-        "sand_sling", "沙弹弓",
-        recipe={"sand": 3, "plank": 1},
-        damage=6, range=3.5, cooldown=0.5,
-        install_fee=15,
-        special={"slow_factor": 0.5, "slow_duration": 1.5},
-        color=(210, 180, 100),
-    ),
+    name: WeaponDef(
+        name,
+        d["label_cn"],
+        dict(d["recipe"]),
+        d["damage"],
+        d["range"],
+        d["cooldown"],
+        d["install_fee"],
+        special=dict(d.get("special", {})),
+        color=tuple(d["color"]),
+        requires_tech=tuple(d.get("requires_tech", [])),
+    )
+    for name, d in gamedata.WEAPONS_RAW.items()
 }
 
 
-# ─── 经典塔的材料配方（用于拆除回收） ──────────────────────
+# ─── 经典塔的材料配方（用于拆除回收，来自 data/towers.json） ──
 # 经典塔仍用金钱购买，但记录材料配方供拆除回收
 
-CLASSIC_TOWER_MATERIALS = {
-    "stone_thrower": {"cobble": 3},
-    "water_cannon": {"cobble": 2, "plank": 2},
-    "sand_trap": {"sand": 4},
-    "metal_tower": {"iron_ingot": 2},
-}
+CLASSIC_TOWER_MATERIALS = gamedata.CLASSIC_TOWER_MATERIALS
 
-DISMANTLE_REFUND = 0.5  # 拆除回收比例
+DISMANTLE_REFUND = gamedata.DISMANTLE_REFUND  # 拆除回收比例
 
 
 # ─── 背包 ──────────────────────────────────────────────────
