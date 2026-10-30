@@ -14,6 +14,7 @@ from items import (
     WEAPON_TYPES, TOOL_TYPES, PROCESS_RECIPES,
     can_craft_weapon, can_craft_tool,
 )
+from blocks import BLOCK_NAME, get_block_by_name, get_placeable_blocks
 from rl_utils import *
 
 
@@ -57,12 +58,12 @@ class UIRenderer:
                   color(*uc.HUD_TEXT_WHITE))
 
         draw_text(f"Score: {game.score}", uc.HUD_SCORE_X, 12, uc.HUD_TEXT_SIZE, color(*uc.HUD_TEXT_SCORE))
-        draw_text(f"FPS: {game.fps}", screen_w - uc.HUD_FPS_X_OFFSET, 12, uc.HUD_TEXT_SIZE, color(*uc.HUD_TEXT_FPS))
+        draw_text(f"FPS: {game.fps:.1f}", screen_w - uc.HUD_FPS_X_OFFSET, 12, uc.HUD_TEXT_SIZE, color(*uc.HUD_TEXT_FPS))
 
         # 材料栏
         draw_rect(0, uc.HUD_TOP_HEIGHT, screen_w, uc.HUD_MATERIAL_HEIGHT, color(*uc.HUD_MATERIAL_BG))
         mat_x = uc.HUD_MAT_X_START
-        for mat_name in ("wood", "stone", "sand", "iron_ore", "plank", "cobble", "iron_ingot"):
+        for mat_name in ("dirt", "wood", "stone", "sand", "iron_ore", "plank", "cobble", "iron_ingot"):
             amt = game.inventory.get_material(mat_name)
             if amt > 0:
                 mc = MATERIAL_COLORS.get(mat_name, (200, 200, 200))
@@ -85,33 +86,77 @@ class UIRenderer:
             draw_text(tool_str, screen_w - uc.HUD_TOOL_X_OFFSET, uc.HUD_MAT_Y2,
                       uc.HUD_TINY_TEXT_SIZE, color(*uc.HUD_TEXT_TOOL))
 
-        # 塔选择栏
+        # 塔选择栏（分段按钮：支持鼠标点击选中，用于无热键的防御塔）
         bar_y = screen_h - uc.HUD_BAR_Y_OFFSET
         draw_rect(0, bar_y, screen_w, uc.HUD_BAR_HEIGHT, color(*uc.HUD_BAR_BG))
 
-        parts = ["Towers:"]
-        for key, label, type_name in zip(uc.TOWER_BAR_NUMS, uc.TOWER_BAR_LABELS, uc.TOWER_BAR_KEYS):
-            tt = TOWER_TYPES[type_name]
-            if tt.requires_tech:
+        if game.interaction_mode == "place":
+            # 放置模式：塔栏让位给方块选择栏（block bar 渲染在下方单独方法里）
+            self._tower_bar_rects = []
+        else:
+            self._tower_bar_rects = []
+            seg_x = 10
+            draw_text("Towers:", seg_x, bar_y + 8, uc.HUD_SMALL_TEXT_SIZE, color(*uc.HUD_TEXT_TOOL))
+            seg_x += measure_text("Towers:", uc.HUD_SMALL_TEXT_SIZE) + 10
+            for key, label, type_name in zip(uc.TOWER_BAR_NUMS, uc.TOWER_BAR_LABELS,
+                                              uc.TOWER_BAR_KEYS):
+                tt = TOWER_TYPES[type_name]
                 missing = [t for t in tt.requires_tech if not game.has_tech(t)]
+                seg_text = f"[{key}]{label}" + (" (lock)" if missing else "")
+                seg_w = measure_text(seg_text, uc.HUD_SMALL_TEXT_SIZE) + 8
+                seg_y, seg_h = bar_y + 5, 20
+                selected = (game.selected_tower_type is tt)
                 if missing:
-                    parts.append(f"[{key}]{label} (lock)")
-                    continue
-            parts.append(f"[{key}]{label}")
-        draw_text(" ".join(parts), 10, bar_y + 8, uc.HUD_SMALL_TEXT_SIZE, color(*uc.HUD_TEXT_TOOL))
+                    seg_bg = uc.TOWER_BAR_LOCK_BG
+                elif selected:
+                    seg_bg = uc.TOWER_BAR_SELECTED_BG
+                else:
+                    seg_bg = uc.TOWER_BAR_SEG_BG
+                draw_rect(seg_x, seg_y, seg_w, seg_h, color(*seg_bg))
+                if selected:
+                    draw_rect_lines(rect(seg_x, seg_y, seg_w, seg_h), 1,
+                                    color(*uc.TOWER_BAR_SELECTED_BORDER))
+                seg_color = uc.TOWER_BAR_LOCK_TEXT if missing else uc.HUD_TEXT_TOOL
+                draw_text(seg_text, seg_x + 4, seg_y + 4, uc.HUD_SMALL_TEXT_SIZE,
+                          color(*seg_color))
+                self._tower_bar_rects.append((seg_x, seg_y, seg_w, seg_h, type_name))
+                seg_x += seg_w + 4
 
-        if game.interaction_mode == "dismantle":
+        if game.interaction_mode == "dig":
+            draw_text("[R] Digging: ON | Click/Hold to break top block and harvest",
+                      10, bar_y + 28, uc.HUD_TINY_TEXT_SIZE, color(180, 255, 180))
+        elif game.interaction_mode == "place":
+            draw_text("[F] Placing: ON | [1]泥土 [2]石头 [3]沙子 [4]原木 | "
+                      "Click to place (consumes material) | Esc:cancel",
+                      10, bar_y + 28, uc.HUD_TINY_TEXT_SIZE, color(180, 255, 180))
+        elif game.interaction_mode == "dismantle":
             draw_text("[X] Dismantle: ON | Click tower to remove", 10, bar_y + 28,
                       uc.HUD_TINY_TEXT_SIZE, color(255, 120, 120))
+        elif game.interaction_mode == "unmount":
+            draw_text("[U] Unmount: ON | Click wall tower to take weapons back "
+                      "(Shift = all)", 10, bar_y + 28,
+                      uc.HUD_TINY_TEXT_SIZE, color(255, 190, 120))
         elif game.craft_panel_open:
             draw_text("[B] Craft Panel Open", 10, bar_y + 28,
                       uc.HUD_TINY_TEXT_SIZE, color(255, 200, 100))
+        elif game.selected_tower_type and game.selected_tower_type.no_attack:
+            draw_text(f"Placing {game.selected_tower_type.name_cn} (no attack) | "
+                      f"slots {game.selected_tower_type.weapon_slots} | "
+                      f"after placing, click it with a weapon to mount | "
+                      f"[U] take weapons back",
+                      10, bar_y + 28, uc.HUD_TINY_TEXT_SIZE, color(200, 205, 225))
         elif game.selected_weapon:
             draw_text(f"Placing: {game.selected_weapon.label_cn} (${game.selected_weapon.install_fee}) | Esc:cancel",
                       10, bar_y + 28, uc.HUD_TINY_TEXT_SIZE, color(180, 255, 180))
         else:
-            draw_text("V:2D/3D | T:Tech | B:Craft | X:Dismantle | F8:存档 | Click:Harvest/Upgrade",
+            draw_text("V:2D/3D | T:Tech | B:Craft | C:Weapons | X:Dismantle | "
+                      "U:Unmount | R:Dig | F:Place | F8:存档 | M:小地图 | "
+                      "Click:Harvest/Upgrade",
                       10, bar_y + 28, uc.HUD_TINY_TEXT_SIZE, color(*uc.HUD_TEXT_DIM))
+
+        # 放置模式：方块选择栏（复用塔栏分段样式）
+        if game.interaction_mode == "place":
+            self._render_block_bar(game, bar_y)
 
         # 当前选择
         if game.selected_tower_type:
@@ -147,6 +192,17 @@ class UIRenderer:
         draw_text_centered(detail, screen_h // 2 + 20,
                            uc.WAVE_ANNOUNCE_DETAIL_SIZE, color(200, 200, 220))
         set_alpha(1.0)
+
+    def tower_hit_type(self, mx, my):
+        """塔选择栏鼠标命中：返回被点中的塔类型名（可放置时）或 None。
+
+        布局与 render_hud 的塔栏分段完全同构。锁定塔(科技未解锁)返回 None，
+        由调用方 toast 提示。
+        """
+        for rx, ry, rw, rh, type_name in getattr(self, "_tower_bar_rects", []):
+            if rx <= mx <= rx + rw and ry <= my <= ry + rh:
+                return type_name
+        return None
 
     def craft_hit_action(self, game, mx, my):
         """合成面板鼠标命中：返回 (action_type, target) 或 None。
@@ -596,6 +652,9 @@ class UIRenderer:
 
     def render_placement_preview(self, game):
         """渲染塔放置预览（经典塔 + 武器塔）"""
+        # 2D 视图下由地形渲染覆盖，3D 图元会画成退化形状（与 render_block_edit_preview 一致）
+        if not game.camera.is_3d():
+            return
         uc = ui_config
         wx, wy, wz = game.camera.screen_to_world(rl.GetMouseX(), rl.GetMouseY())
         x, z = math.floor(wx), math.floor(wz)
@@ -608,12 +667,12 @@ class UIRenderer:
             c = color(*uc.PLACE_PREVIEW_VALID_COLOR) if ok else color(*uc.PLACE_PREVIEW_INVALID_COLOR)
             set_alpha(uc.PLACE_PREVIEW_ALPHA_VALID if ok else uc.PLACE_PREVIEW_ALPHA_INVALID)
             sz = uc.PLACE_PREVIEW_CUBE_SIZE
-            draw_cube(vec3(x + 0.5, game.universe._surface_height_pure(x, z) + 1.0, z + 0.5),
+            draw_cube(vec3(x + 0.5, game.universe.surface_height_at(x, z) + 1.0, z + 0.5),
                       sz[0], sz[1], sz[2], c)
             set_alpha(1.0)
             if valid:
                 set_alpha(uc.PLACE_PREVIEW_RANGE_ALPHA)
-                draw_ring_3d(vec3(x + 0.5, game.universe._surface_height_pure(x, z) + 0.1, z + 0.5),
+                draw_ring_3d(vec3(x + 0.5, game.universe.surface_height_at(x, z) + 0.1, z + 0.5),
                              game.selected_weapon.range, color(*uc.PLACE_PREVIEW_RANGE_COLOR))
                 set_alpha(1.0)
             return
@@ -628,13 +687,17 @@ class UIRenderer:
         c = color(*uc.PLACE_PREVIEW_VALID_COLOR) if ok else color(*uc.PLACE_PREVIEW_INVALID_COLOR)
         set_alpha(uc.PLACE_PREVIEW_ALPHA_VALID if ok else uc.PLACE_PREVIEW_ALPHA_INVALID)
         sz = uc.PLACE_PREVIEW_CUBE_SIZE
-        draw_cube(vec3(x + 0.5, game.universe._surface_height_pure(x, z) + 1.0, z + 0.5),
-                  sz[0], sz[1], sz[2], c)
+        # 防御塔更高（与其实际塔身高度一致），无攻击塔不加宽
+        cube_h = uc.PLACE_PREVIEW_WALL_CUBE_HEIGHT if game.selected_tower_type.no_attack \
+            else sz[1]
+        draw_cube(vec3(x + 0.5, game.universe.surface_height_at(x, z) + 1.0, z + 0.5),
+                  sz[0], cube_h, sz[2], c)
         set_alpha(1.0)
 
-        if valid:
+        # 射程环：防御塔无射程（base_range=0）不画，避免出现退化/异常圆环
+        if valid and game.selected_tower_type.base_range > 0:
             set_alpha(uc.PLACE_PREVIEW_RANGE_ALPHA)
-            draw_ring_3d(vec3(x + 0.5, game.universe._surface_height_pure(x, z) + 0.1, z + 0.5),
+            draw_ring_3d(vec3(x + 0.5, game.universe.surface_height_at(x, z) + 0.1, z + 0.5),
                          game.selected_tower_type.base_range, color(*uc.PLACE_PREVIEW_RANGE_COLOR))
             set_alpha(1.0)
 
@@ -646,3 +709,77 @@ class UIRenderer:
         for tower in game.towers:
             pos = tower.position
             draw_cube((pos[0], pos[1] + 0.5, pos[2]), sz[0], sz[1], sz[2], color_val)
+
+    # ─── 玩家挖/放方块 UI ───────────────────────────────────
+
+    def _render_block_bar(self, game, bar_y):
+        """放置模式的方块选择栏（复用塔栏分段样式，布局与 block_bar_hit 同构）。"""
+        uc = ui_config
+        self._block_bar_rects = []
+        seg_x = 10
+        draw_text("Blocks:", seg_x, bar_y + 8, uc.HUD_SMALL_TEXT_SIZE,
+                  color(*uc.HUD_TEXT_TOOL))
+        seg_x += measure_text("Blocks:", uc.HUD_SMALL_TEXT_SIZE) + 10
+        for i, bdef in enumerate(get_placeable_blocks()):
+            label = bdef.name
+            seg_text = f"[{i + 1}]{label}"
+            seg_w = measure_text(seg_text, uc.HUD_SMALL_TEXT_SIZE) + 8
+            seg_y, seg_h = bar_y + 5, 20
+            selected = (game.selected_block_id == bdef.id)
+            if selected:
+                seg_bg = uc.TOWER_BAR_SELECTED_BG
+            else:
+                seg_bg = uc.TOWER_BAR_SEG_BG
+            draw_rect(seg_x, seg_y, seg_w, seg_h, color(*seg_bg))
+            if selected:
+                draw_rect_lines(rect(seg_x, seg_y, seg_w, seg_h), 1,
+                                color(*uc.TOWER_BAR_SELECTED_BORDER))
+            draw_text(seg_text, seg_x + 4, seg_y + 4, uc.HUD_SMALL_TEXT_SIZE,
+                      color(*uc.HUD_TEXT_TOOL))
+            self._block_bar_rects.append((seg_x, seg_y, seg_w, seg_h, bdef.id))
+            seg_x += seg_w + 4
+
+    def block_bar_hit(self, mx, my):
+        """方块选择栏鼠标命中：返回方块 ID 或 None。"""
+        for rx, ry, rw, rh, block_id in getattr(self, "_block_bar_rects", []):
+            if rx <= mx <= rx + rw and ry <= my <= ry + rh:
+                return block_id
+        return None
+
+    def render_block_edit_preview(self, game):
+        """挖掘/放置模式的方块编辑预览（仅 3D 相机绘制，2D 由地形渲染覆盖）。"""
+        uc = ui_config
+        if not game.camera.is_3d():
+            return
+        wx, wy, wz = game.camera.screen_to_world(rl.GetMouseX(), rl.GetMouseY())
+        x, z = math.floor(wx), math.floor(wz)
+        if game.interaction_mode == "dig":
+            top_id = game.universe.top_block_id(x, z)
+            bdef = get_block_by_name(BLOCK_NAME.get(top_id, "air"))
+            harvestable = (bdef is not None and bdef.harvest_material is not None)
+            c = color(*uc.PLACE_PREVIEW_VALID_COLOR) if harvestable \
+                else color(*uc.PLACE_PREVIEW_INVALID_COLOR)
+            set_alpha(uc.PLACE_PREVIEW_ALPHA_VALID if harvestable
+                      else uc.PLACE_PREVIEW_ALPHA_INVALID)
+            y = game.universe.surface_height_at(x, z) + 1.0
+            sz = uc.PLACE_PREVIEW_CUBE_SIZE
+            draw_cube(vec3(x + 0.5, y, z + 0.5), sz[0], sz[1], sz[2], c)
+            set_alpha(1.0)
+        else:  # place
+            if game.selected_block_id is None:
+                return
+            bdef = get_block_by_name(BLOCK_NAME.get(game.selected_block_id, "air"))
+            if bdef is None or not bdef.placeable:
+                return
+            valid = game._is_valid_placement(x, z)
+            mat = bdef.place_material or bdef.harvest_material
+            has_mat = bool(mat) and game.inventory.get_material(mat) >= 1
+            ok = valid and has_mat
+            c = color(*uc.PLACE_PREVIEW_VALID_COLOR) if ok \
+                else color(*uc.PLACE_PREVIEW_INVALID_COLOR)
+            set_alpha(uc.PLACE_PREVIEW_ALPHA_VALID if ok
+                      else uc.PLACE_PREVIEW_ALPHA_INVALID)
+            y = game.universe.surface_height_at(x, z) + 1.0
+            sz = uc.PLACE_PREVIEW_CUBE_SIZE
+            draw_cube(vec3(x + 0.5, y, z + 0.5), sz[0], sz[1], sz[2], c)
+            set_alpha(1.0)

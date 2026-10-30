@@ -174,6 +174,7 @@ WAVE_ANNOUNCE_DETAIL_SIZE = 16
 
 # ─── 放置预览 ──────────────────────────────────────────────
 PLACE_PREVIEW_CUBE_SIZE = (0.6, 1.0, 0.6)
+PLACE_PREVIEW_WALL_CUBE_HEIGHT = 2.2   # 防御塔预览高度（与实际墙塔塔身一致）
 PLACE_PREVIEW_VALID_COLOR = (100, 255, 100)
 PLACE_PREVIEW_INVALID_COLOR = (255, 100, 100)
 PLACE_PREVIEW_RANGE_COLOR = (100, 200, 100)
@@ -186,6 +187,54 @@ DISMANTLE_HIGHLIGHT_COLOR = (255, 60, 60, 80)
 DISMANTLE_HIGHLIGHT_SIZE = (0.7, 1.1, 0.7)
 
 # ─── 塔选择栏 ──────────────────────────────────────────────
-TOWER_BAR_KEYS = ["stone_thrower", "water_cannon", "sand_trap", "metal_tower"]
-TOWER_BAR_LABELS = ["Stone", "Water", "Sand", "Metal"]
-TOWER_BAR_NUMS = ["1", "2", "3", "4"]
+TOWER_BAR_KEYS = ["stone_thrower", "water_cannon", "sand_trap", "metal_tower",
+                  "palisade_wall", "city_wall", "star_fort"]
+TOWER_BAR_LABELS = ["Stone", "Water", "Sand", "Metal", "Wall", "City", "Fort"]
+TOWER_BAR_NUMS = ["1", "2", "3", "4", "9", "0", "点"]
+# 塔栏分段按钮样式
+TOWER_BAR_SEG_BG = (48, 52, 68, 200)
+TOWER_BAR_SELECTED_BG = (72, 96, 130, 230)
+TOWER_BAR_LOCK_BG = (44, 44, 54, 200)
+TOWER_BAR_SELECTED_BORDER = (255, 220, 100)
+TOWER_BAR_LOCK_TEXT = (120, 120, 140)
+
+# ─── 小地图 ────────────────────────────────────────────────
+MINIMAP_ENABLED_DEFAULT = True
+MINIMAP_LEVELS = (128, 256, 512, 1024)  # 倍程序列（半边长，格），基地居中
+MINIMAP_ZOOM_MARGIN = 1.15  # 缩放迟滞比：升档即时、降档需 1/MARGIN 余量
+MINIMAP_TEX_PX = 256       # 烘焙纹理边长（1 像素 = step×step 格）
+MINIMAP_SIZE = 200         # 屏幕显示尺寸（正方形像素）
+MINIMAP_MARGIN = 12        # 距屏幕右缘
+MINIMAP_Y = 86             # 顶栏 40 + 材料栏 38 + 间距 8
+MINIMAP_HINT_SIZE = 11     # 底部提示字号
+
+MINIMAP_BORDER_COLOR = (210, 210, 230, 255)
+MINIMAP_BORDER_H = 16      # 底部提示条高度
+MINIMAP_HINT_BG = (20, 20, 30, 170)
+MINIMAP_HINT_COLOR = (190, 190, 210)
+MINIMAP_BASE_COLOR = (255, 255, 255, 255)
+MINIMAP_BASE_SIZE = 4
+MINIMAP_TOWER_SIZE = 2
+MINIMAP_ENEMY_SIZE = 2
+MINIMAP_SPAWNER_SIZE = 3
+MINIMAP_SPAWNER_DORMANT = (110, 110, 125, 190)    # 休眠点 1px 暗灰
+MINIMAP_EDGE_DOT_ACTIVE = (255, 95, 95, 230)      # 出界唤醒点：真方向边缘点
+MINIMAP_EDGE_DOT_SCOUTING = (255, 225, 95, 230)
+MINIMAP_ARROW_COLOR = (255, 235, 140, 235)        # 相机出界方向箭头 + 距离
+MINIMAP_PATH_COLOR = (255, 200, 50, 80)           # 烘焙路径叠加（仿 2D 路径色）
+MINIMAP_CAMERA_COLOR = (255, 255, 255, 210)       # 2D 视野框
+MINIMAP_CAMERA_3D_COLOR = (130, 255, 130, 230)    # 3D target 十字/示意框
+MINIMAP_CONTOUR_STEP = 1 / 32    # 等高线间隔（归一化高度；×2048 = 64 方块一根）
+MINIMAP_CONTOUR_MAJOR_EVERY = 2  # 隔一根一条主线（128 格）：细线恰在两主线
+                                 # 正中，读数 = 邻主线 ±64 两向同值，无追踪歧义
+MINIMAP_CONTOUR_COLOR = (35, 25, 15, 80)          # 细线：深褐半透明
+MINIMAP_CONTOUR_MAJOR_COLOR = (35, 25, 15, 130)   # 主线加重
+MINIMAP_CONTOUR_LABEL_SERVE = 48  # 标签服务半径（纹理像素）：线上候选点
+                                  # 落在任一同线标签半径内即视为已覆盖，
+                                  # 同高程的每条线段各自获得标签。取值
+                                  # 需小于典型独立线段的间距，否则邻近
+                                  # 线段会被误覆盖（有线无字）。
+MINIMAP_CONTOUR_LABEL_CAP_RANGE = (2, 20)  # 每条线标签数硬上限（保险丝：
+                                           # 正常密度由服务半径决定）
+MINIMAP_CONTOUR_LABEL_COLOR = (35, 25, 15, 255)   # 标签墨色（不透明）
+MINIMAP_CONTOUR_LABEL_HALO = 0.55   # 标签底向白混合比例（地形图留白）

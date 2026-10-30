@@ -49,8 +49,15 @@ def _serialize_tower(t) -> dict:
         "cooldown": t.cooldown,
         "cooldown_timer": t.cooldown_timer,
         "active": t.active,
+        "hp": t.hp,
+        "max_hp": t.max_hp,
         "source": list(t.source) if t.source else ["classic", t.type_name],
         "material_recipe": dict(t.material_recipe) if t.material_recipe else {},
+        # 防御塔挂载的武器（v6+；旧档缺省为空）
+        "mounted_weapons": [
+            {"weapon": m["wdef"].name, "damage_mult": m["damage_mult"]}
+            for m in getattr(t, "weapon_mounts", [])
+        ],
     }
 
 
@@ -58,7 +65,7 @@ def _serialize_enemy(e) -> dict:
     return {
         "type_name": e.type_name,
         "position": list(e.position),
-        "path_ref": getattr(e, "home_spawner_id", 0),
+        "path_ref": getattr(e, "home_spawner_id", -1),
         "path_index": e.path_index,
         "health": e.health,
         "max_health": e.max_health,
@@ -83,6 +90,16 @@ def _serialize_enemy(e) -> dict:
         "wander_lifetime": getattr(e, "wander_lifetime", 0.0),
         "return_path": [list(pt) for pt in getattr(e, "return_path", ())],
         "return_path_index": getattr(e, "return_path_index", 0),
+        # 寻路状态（v5+）
+        "path_variant": getattr(e, "path_variant", 0),
+        "path_version": getattr(e, "path_version", -1),
+        "attack_timer": getattr(e, "attack_timer", 0.0),
+        "dig_target": list(getattr(e, "dig_target", None) or []),
+        "dig_progress": getattr(e, "dig_progress", 0.0),
+        "dig_y": getattr(e, "dig_y", None),
+        "dig_base_y": getattr(e, "dig_base_y", None),
+        "dig_passed": bool(getattr(e, "dig_passed", False)),
+        "repath_timer": getattr(e, "repath_timer", 0.0),
     }
 
 
@@ -159,6 +176,22 @@ def serialize_game(game) -> dict:
             "avg_slope": pd.avg_slope,
         })
 
+    # 寻路变体路径（v5+，{(sid,type): [PathData]} → 扁平列表）
+    variants_data = []
+    pf = getattr(game, "pathfinder", None)
+    if pf is not None:
+        for (sid, type_name), entry in pf.variants.items():
+            for idx, pd in enumerate(entry.get("paths", [])):
+                variants_data.append({
+                    "spawner_id": sid,
+                    "type_name": type_name,
+                    "index": idx,
+                    "points": [list(pt) for pt in pd.points],
+                    "length": pd.length,
+                    "avg_slope": pd.avg_slope,
+                    "dig_cells": [list(c) for c in pd.dig_cells],
+                })
+
     # 塔（用于 projectile 的 source_tower 索引）
     tower_ids = {id(t): i for i, t in enumerate(game.towers)}
 
@@ -174,6 +207,7 @@ def serialize_game(game) -> dict:
         "created_at": time.time(),
         "seed": universe.seed,
         "paths": paths_data,
+        "variants": variants_data,
         "game": {
             "money": game.money,
             "score": game.score,
@@ -225,6 +259,11 @@ def serialize_game(game) -> dict:
         "world": {
             "rng_state": _serialize_rng(universe.rng),
             "harvested_cells": [list(c) for c in universe._harvested_cells],
+            "world_version": universe.world_version,
+            "block_edits": [[x, y, z, b]
+                            for (x, y, z), b in universe.block_edits.items()],
+            "surface_override": [[x, z, y]
+                                 for (x, z), y in universe.surface_override.items()],
             "weather": {
                 "is_raining": universe.weather.is_raining,
                 "is_snowing": universe.weather.is_snowing,
@@ -317,6 +356,79 @@ def _restore_weather(universe, weather_data):
     w.wind_strength = weather_data.get("wind_strength", w.wind_strength)
 
 
+def _restore_terrain_edits(universe, world_data):
+    """恢复地形编辑覆盖层（挖掘痕迹）。v5+，旧存档无此段则跳过。"""
+    if not world_data:
+        return
+    universe.block_edits = {}
+    for item in world_data.get("block_edits", []):
+        try:
+            x, y, z, b = int(item[0]), int(item[1]), int(item[2]), int(item[3])
+        except (TypeError, ValueError, IndexError):
+            continue
+        universe.block_edits[(x, y, z)] = b
+    universe.surface_override = {}
+    for item in world_data.get("surface_override", []):
+        try:
+            x, z, y = int(item[0]), int(item[1]), int(item[2])
+        except (TypeError, ValueError, IndexError):
+            continue
+        universe.surface_override[(x, z)] = y
+    universe.world_version = world_data.get("world_version", 0)
+    # 重建区块索引
+    cs = config.CHUNK_SIZE
+    universe._edits_by_chunk = {}
+    for (x, y, z) in universe.block_edits:
+        universe._edits_by_chunk.setdefault(
+            (x // cs, z // cs), set()).add((x, y, z))
+    # 已加载的区块（基地周边）立即重放，避免挖掘痕迹缺失
+    for key in list(universe.chunks):
+        chunk = universe.chunks[key]
+        if key in universe._edits_by_chunk:
+            universe._replay_chunk_edits(chunk)
+
+
+def _restore_variants(game, variants_data):
+    """恢复寻路变体缓存。v5+，缺省时各变体惰性重算。"""
+    pf = getattr(game, "pathfinder", None)
+    if pf is None or not variants_data:
+        return
+    from world import PathData
+    grouped = {}
+    for vd in variants_data:
+        try:
+            sid = int(vd.get("spawner_id", 0))
+            type_name = str(vd.get("type_name", ""))
+            idx = int(vd.get("index", 0))
+            points = tuple(tuple(pt) for pt in vd.get("points", []))
+        except (TypeError, ValueError):
+            continue
+        if not points or not type_name:
+            continue
+        dig_cells = frozenset(
+            (int(c[0]), int(c[1]))
+            for c in vd.get("dig_cells", [])
+            if isinstance(c, (list, tuple)) and len(c) >= 2)
+        pd = PathData(
+            points=points,
+            length=vd.get("length", len(points)),
+            avg_slope=vd.get("avg_slope", 0.0),
+            dig_cells=dig_cells,
+        )
+        grouped.setdefault((sid, type_name), {})[idx] = pd
+    for (sid, type_name), by_idx in grouped.items():
+        paths = [by_idx[i] for i in sorted(by_idx)]
+        pf.variants[(sid, type_name)] = {
+            "version": game.universe.world_version,
+            "paths": paths,
+        }
+    # 路径格并入全局集合（道具避让语义沿用）
+    for entry in pf.variants.values():
+        for pd in entry["paths"]:
+            for x, _y, z in pd.points:
+                game.universe._path_cells.add((math.floor(x), math.floor(z)))
+
+
 def _restore_camera(cam, cam_data):
     """恢复相机状态。缺失字段保持默认。*_target 设为当前值避免平滑过渡。"""
     if not cam_data:
@@ -343,27 +455,45 @@ def _restore_camera(cam, cam_data):
 def _restore_towers(data, towers_data):
     """从存档重建塔列表。未知类型跳过+警告。"""
     from entities import TOWER_TYPES, Tower
-    from items import CLASSIC_TOWER_MATERIALS
+    from items import CLASSIC_TOWER_MATERIALS, WEAPON_TYPES
     towers = []
     for td in towers_data:
         type_name = td.get("type_name", "")
         tt = TOWER_TYPES.get(type_name)
-        if tt is None:
-            print(f"[存档] 跳过未知塔类型: {type_name}")
-            continue
         try:
             pos = tuple(td.get("position", [0, 0, 0]))
         except (TypeError, ValueError):
             continue
         level = td.get("level", 1)
         damage_mult = td.get("damage_mult", 1.0)
-        tower = Tower(tt, pos, level, damage_mult)
+        if tt is not None:
+            tower = Tower(tt, pos, level, damage_mult)
+        else:
+            # 武器派生塔：type_name 是武器名（如 wood_club），不在 TOWER_TYPES 中，
+            # 需按 WEAPON_TYPES 重建，否则武器塔会在读档时被静默丢弃。
+            wdef = WEAPON_TYPES.get(type_name)
+            if wdef is None:
+                print(f"[存档] 跳过未知塔类型: {type_name}")
+                continue
+            tower = Tower.from_weapon(wdef, pos, damage_mult)
+            tower.level = level
         # 覆盖存档中的实际数值（可能与重算不同，如升级/科技加成后）
         tower.damage = td.get("damage", tower.damage)
         tower.range = td.get("range", tower.range)
         tower.cooldown = td.get("cooldown", tower.cooldown)
         tower.cooldown_timer = td.get("cooldown_timer", 0.0)
         tower.active = td.get("active", True)
+        # 塔体 HP（v5+；旧存档满血）
+        # 武器派生塔的 max_hp 无法从等级推导（TOWER_HP 里没有武器名），
+        # 必须按存档恢复，否则 3 级武器塔会退回 100。
+        saved_max = td.get("max_hp")
+        if isinstance(saved_max, (int, float)) and saved_max > 0:
+            tower.max_hp = float(saved_max)
+        hp = td.get("hp", tower.max_hp)
+        if isinstance(hp, (int, float)):
+            tower.hp = max(0.0, min(float(hp), tower.max_hp))
+        else:
+            tower.hp = tower.max_hp
         src = td.get("source")
         if src and len(src) >= 2:
             tower.source = (src[0], src[1])
@@ -372,6 +502,15 @@ def _restore_towers(data, towers_data):
             tower.material_recipe = dict(CLASSIC_TOWER_MATERIALS.get(type_name, {}))
         else:
             tower.material_recipe = dict(mat_recipe)
+        # 防御塔挂载武器（v6+；旧档无此字段 → 空列表，兼容）
+        for mw in td.get("mounted_weapons") or []:
+            wdef = WEAPON_TYPES.get(mw.get("weapon"))
+            if wdef is None:
+                print(f"[存档] 跳过未知挂载武器: {mw.get('weapon')!r}")
+                continue
+            if not tower.mount_weapon(wdef,
+                                      damage_mult=float(mw.get("damage_mult", 1.0))):
+                break  # 槽位已满：不再挂更多
         towers.append(tower)
     return towers
 
@@ -431,6 +570,18 @@ def _restore_enemies(data, universe, enemies_data):
         if rp:
             enemy.return_path = tuple(tuple(pt) for pt in rp)
         enemy.return_path_index = ed.get("return_path_index", 0)
+        # 寻路状态（v5+，旧存档用默认值）
+        enemy.path_variant = ed.get("path_variant", 0)
+        enemy.path_version = ed.get("path_version", -1)
+        enemy.attack_timer = ed.get("attack_timer", 0.0)
+        dig_t = ed.get("dig_target")
+        enemy.dig_target = (int(dig_t[0]), int(dig_t[1])) \
+            if isinstance(dig_t, (list, tuple)) and len(dig_t) >= 2 else None
+        enemy.dig_progress = ed.get("dig_progress", 0.0)
+        enemy.dig_y = ed.get("dig_y")
+        enemy.dig_base_y = ed.get("dig_base_y")
+        enemy.dig_passed = bool(ed.get("dig_passed", False))
+        enemy.repath_timer = ed.get("repath_timer", 0.0)
         enemies.append(enemy)
     return enemies
 
@@ -507,6 +658,7 @@ def deserialize_game(data: dict):
     world_data = data.get("world") or {}
     harvested = world_data.get("harvested_cells", [])
     universe._harvested_cells = set(tuple(c) for c in harvested)
+    _restore_terrain_edits(universe, world_data)
     _restore_weather(universe, world_data.get("weather"))
     universe.weather_timer = world_data.get("weather_timer", 0.0)
     _restore_rng(universe, world_data.get("rng_state"))
@@ -530,6 +682,7 @@ def deserialize_game(data: dict):
     spawners_data = data.get("spawners") or []
     _restore_spawner_positions(universe, spawners_data)
     _restore_paths(universe, data.get("paths"))
+    _restore_variants(game, data.get("variants"))
 
     # 7) 核心字段
     g = data.get("game") or {}
@@ -601,9 +754,9 @@ def deserialize_game(data: dict):
     game.craft_action = None
     game.toast_message = None
     game.toast_timer = 0.0
-    game.fps = 0
+    game.fps = 0.0
     game.frame_count = 0
-    game.fps_timer = 0.0
+    game._fps_window_start = time.perf_counter()
 
     return game
 
@@ -706,6 +859,20 @@ def migrate_v3_to_v4(data: dict) -> dict:
     return data
 
 
+def migrate_v4_to_v5(data: dict) -> dict:
+    """将 v4 存档迁移到 v5（寻路系统）。
+
+    v5 新增：地形编辑覆盖层 / 变体路径 / 敌人攻击挖掘状态 / 塔体 HP。
+    结构兼容：缺失段全部 .get() 兜底——
+      - 地形编辑缺省 = 无挖掘痕迹（v4 世界本来就没有）；
+      - 变体路径缺省 = 各 (刷怪点×类型) 首次请求时重新计算；
+      - 敌人 path_version 缺省 -1 → 加载后首帧就近重估；
+      - 塔 hp 缺省满血。
+    """
+    data["version"] = 5
+    return data
+
+
 def migrate_v1_to_v2(data: dict) -> dict:
     """将 v1 存档（全局波次）迁移到 v2（刷怪点独立波次）。
 
@@ -798,6 +965,8 @@ def load_game(path) -> "Game | None":
             data = migrate_v2_to_v3(data)
         if data.get("version", 1) == 3:
             data = migrate_v3_to_v4(data)
+        if data.get("version", 1) == 4:
+            data = migrate_v4_to_v5(data)
 
     try:
         game = deserialize_game(data)

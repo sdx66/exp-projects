@@ -6,10 +6,12 @@ game.py - 主游戏循环与状态机
 import raylib as rl
 import math
 import os
+import time
 import config
 import gamedata
 import save_system
-from entities import Tower, Enemy, Pickup, Base, TOWER_TYPES, ENEMY_TYPES
+from entities import (Tower, Enemy, Pickup, Base, EnemyGrid,
+                      TOWER_TYPES, ENEMY_TYPES)
 from items import (
     Inventory, MATERIAL_NAMES_CN,
     WEAPON_TYPES, TOOL_TYPES, PROCESS_RECIPES,
@@ -17,9 +19,12 @@ from items import (
     can_craft_tool, craft_tool, dismantle_refund,
     CLASSIC_TOWER_MATERIALS, DISMANTLE_REFUND,
 )
+from blocks import BLOCK_ID, BLOCK_NAME, get_block_by_name, get_placeable_blocks
 from rl_utils import *
 from ui_renderer import UIRenderer
 from ui_tech_tree import tech_tree_panel
+from ui_minimap import Minimap
+import ui_config
 from dataclasses import dataclass, field
 
 
@@ -73,6 +78,10 @@ class Game:
         self.renderer = renderer
         self.ui = UIRenderer()
 
+        # 小地图（右上角；构造时同步烘焙，摊入开局世界生成耗时）
+        self.minimap = Minimap(universe)
+        self.minimap_visible = ui_config.MINIMAP_ENABLED_DEFAULT
+
         # 游戏状态
         self.state = GameState.PLAYING
         self.money = config.STARTING_MONEY
@@ -93,6 +102,11 @@ class Game:
         if hasattr(universe, "loot_pickups"):
             self.pickups.extend(universe.loot_pickups)
 
+        # 寻路管理器（变体缓存/拥挤/重算预算）+ 塔格 → 塔对象映射（敌人攻击目标查询）
+        from pathfinding import Pathfinder
+        self.pathfinder = Pathfinder(universe)
+        self._towers_by_cell: dict = {}
+
         # 刷怪点运行时（独立波次，各点自治）
         self.spawners: dict = {}  # {spawner_id: SpawnerRuntime}
         self._spawner_hash: dict = {}  # {(hx, hz): [spawner_id, ...]} 空间哈希
@@ -112,9 +126,9 @@ class Game:
 
         # 计时
         self.game_time = 0.0
-        self.fps = 0
+        self.fps = 0.0
         self.frame_count = 0
-        self.fps_timer = 0.0
+        self._fps_window_start = time.perf_counter()
 
         # 科技
         self.unlocked_tech = set()
@@ -131,8 +145,11 @@ class Game:
 
         # 材料/背包/交互
         self.inventory = Inventory()
-        self.interaction_mode = "none"  # "none"|"place_classic"|"place_weapon"|"dismantle"
+        self.interaction_mode = "none"  # "none"|"place_classic"|"place_weapon"|"dismantle"|"unmount"|"dig"|"place"
         self.selected_weapon = None
+        self.selected_block_id = None   # 放置模式当前方块 ID（默认 dirt）
+        self.dig_hold_timer = 0.0       # 连挖冷却计时
+        self._terrain_edit_pending = False  # 本次地形编辑待批量 bump world_version
         self.craft_panel_open = False
         self.weapon_panel_open = False
         self.spawner_panel_open = False
@@ -189,15 +206,19 @@ class Game:
         self.pickups = []
         if hasattr(self.universe, "loot_pickups"):
             self.pickups.extend(self.universe.loot_pickups)
+        # 清空塔格注册（旧版残留会导致重开后路径永久绕行）
+        for cell in list(self.universe._tower_cells):
+            self.universe.remove_tower_cell(*cell)
+        self._towers_by_cell = {}
         self.wave_delay = 3.0
         self.wave_announcement_timer = 0.0
         self.selected_tower_type = None
         self.placing_tower = False
         self.placement_position = None
         self.game_time = 0.0
-        self.fps = 0
+        self.fps = 0.0
         self.frame_count = 0
-        self.fps_timer = 0.0
+        self._fps_window_start = time.perf_counter()
         self.unlocked_tech = set()
         self.tech_researching = None
         self.tech_research_timer = 0.0
@@ -207,6 +228,9 @@ class Game:
         self.inventory.reset()
         self.interaction_mode = "none"
         self.selected_weapon = None
+        self.selected_block_id = None
+        self.dig_hold_timer = 0.0
+        self._terrain_edit_pending = False
         self.craft_panel_open = False
         self.weapon_panel_open = False
         self.spawner_panel_open = False
@@ -220,7 +244,7 @@ class Game:
         self._pending_replace = None
 
     def _spawn_enemy_for(self, rt):
-        """为指定刷怪点生成一个波次敌人（使用该点自身路径）。"""
+        """为指定刷怪点生成一个波次敌人（按类型偏好从变体集中选路）。"""
         if rt.enemy_count >= rt.max_enemies:
             return
 
@@ -229,12 +253,20 @@ class Game:
         if not enemy_type:
             return
 
-        # 确保路径已生成（延迟生成，激活时调过，这里兜底）
-        if rt.spawner_id not in self.universe.enemy_paths:
-            self.universe._ensure_path(rt.spawner_id)
-        path = self.universe.enemy_paths.get(rt.spawner_id)
-        if not path or not path.points:
-            return
+        # 从寻路管理器取该刷怪点×类型的变体路径；无则兜底 legacy 噪声路径
+        variants = self.pathfinder.get_variants(rt.spawner_id, type_name)
+        path = None
+        if variants:
+            path = Enemy.pick_path(enemy_type, variants,
+                                   self.pathfinder.path_occupancy,
+                                   self.universe.rng)
+        if path is None:
+            if rt.spawner_id not in self.universe.enemy_paths:
+                self.universe._ensure_path(rt.spawner_id)
+            path = self.universe.enemy_paths.get(rt.spawner_id)
+            if not path or not path.points:
+                return
+            variants = [path]
 
         start = path.points[0]
         wave = rt.wave_num
@@ -245,9 +277,11 @@ class Game:
         reward = int(enemy_type.base_reward
                      * (1 + wave * eg.get("reward_growth", 0.1)))
 
-        enemy = Enemy(enemy_type, start, path, all_paths=[path],
-                       rng=self.universe.rng)
+        enemy = Enemy(enemy_type, start, path, all_paths=variants,
+                      rng=self.universe.rng)
         enemy.home_spawner_id = rt.spawner_id
+        enemy.path_variant = variants.index(path)
+        enemy.path_version = self.universe.world_version
         enemy.health = int(enemy.health * health_mult)
         enemy.max_health = enemy.health
         enemy.speed = enemy_type.base_speed * speed_mult
@@ -334,15 +368,19 @@ class Game:
 
     def _query_spawner_hash(self, x, z, radius, check_dormant=True):
         """查询空间哈希中半径内的 dormant 刷怪点 id 列表。"""
+        sp_hash = self._spawner_hash
+        if not sp_hash:
+            return []
         cell = 16
         r = int(math.ceil(radius / cell))
         hx, hz = int(math.floor(x)) // cell, int(math.floor(z)) // cell
+        get = sp_hash.get
         result = []
         for dx in range(-r, r + 1):
             for dz in range(-r, r + 1):
-                for sid in self._spawner_hash.get((hx + dx, hz + dz), []):
-                    if sid not in result:
-                        result.append(sid)
+                bucket = get((hx + dx, hz + dz))
+                if bucket:
+                    result.extend(bucket)
         return result
 
     # ─── 刷怪点种类触发半径（来自 data/spawners.json） ─────────
@@ -398,6 +436,49 @@ class Game:
             if dx * dx + dz * dz <= kr * kr:
                 self._enter_scouting(rt)
                 self._spawner_hash_dirty = True
+
+    def _register_edit(self, x, z):
+        """挖/放方块事件：像造塔一样唤醒 edit 半径内的休眠刷怪点进入侦察。
+
+        连挖/连放同一区域时，刷怪点被唤醒一次后即非 dormant，不会重复触发。
+        """
+        r = self._trigger_max_radius("edit")
+        if self._spawner_hash_dirty:
+            self._rebuild_spawner_hash()
+        for sid in self._query_spawner_hash(x, z, r):
+            rt = self.spawners.get(sid)
+            if not rt or rt.mode != "dormant":
+                continue
+            sp = self.universe.spawners.get(sid)
+            if sp is None:
+                continue
+            kr = self._kind_radius_of(sp, "edit")
+            dx = sp.x + 0.5 - x
+            dz = sp.z + 0.5 - z
+            if dx * dx + dz * dz <= kr * kr:
+                self._enter_scouting(rt)
+                self._spawner_hash_dirty = True
+
+    def _notify_scouts_of_edit(self, x, z):
+        """挖/放方块瞬间：edit_radius 内的侦察兵获得信息并立刻带消息回巢。
+
+        游荡态直接 _start_return；回巢态只补标 has_message（到达即上报激活）。
+        距离以编辑点 (x+0.5, z+0.5) 到侦察兵世界坐标为平方距离判定。
+        """
+        ex, ez = x + 0.5, z + 0.5
+        for enemy in self.enemies:
+            if not enemy.active:
+                continue
+            if enemy.behavior not in ("scout_wander", "scout_return"):
+                continue
+            cfg = getattr(enemy, "scout_cfg", None) or gamedata.STANDARD_SCOUT
+            radius = float(cfg.get("edit_radius", 12.0))
+            dx = enemy.position[0] - ex
+            dz = enemy.position[2] - ez
+            if dx * dx + dz * dz <= radius * radius:
+                enemy.has_message = True
+                if enemy.behavior == "scout_wander":
+                    enemy._start_return(self.universe)
 
     def _update_global_phase(self):
         """更新全局阶段 = max active spawner wave_num。"""
@@ -528,13 +609,15 @@ class Game:
             if rl.IsKeyPressed(rl.KEY_ENTER):
                 self._restart()
 
-        # FPS 计数
+        # FPS 计数：按真实墙钟时间统计，不能使用被 main 限制过的 dt，
+        # 否则首帧长时间生成地形会被少算，显示值会虚高。
         self.frame_count += 1
-        self.fps_timer += dt
-        if self.fps_timer >= 1.0:
-            self.fps = self.frame_count
+        now = time.perf_counter()
+        elapsed = now - self._fps_window_start
+        if elapsed >= config.FPS_UPDATE_INTERVAL:
+            self.fps = self.frame_count / elapsed
             self.frame_count = 0
-            self.fps_timer = 0.0
+            self._fps_window_start = now
 
         # 更新相机（科技树面板打开时暂停）
         if self.state != GameState.TECH_PANEL:
@@ -556,6 +639,25 @@ class Game:
 
     def _update_playing(self, dt):
         """更新游戏进行中状态"""
+        # ── 寻路帧预算 + 占用快照 ──
+        self.pathfinder.begin_frame()
+        occ = {}
+        po = {}
+        for e in self.enemies:
+            if not e.active:
+                continue
+            key = (math.floor(e.position[0]), math.floor(e.position[2]))
+            occ[key] = occ.get(key, 0) + 1
+            if e.behavior == "wave" and e.path is not None:
+                pk = id(e.path)
+                po[pk] = po.get(pk, 0) + 1
+        self.pathfinder.occupancy = occ
+        self.pathfinder.path_occupancy = po
+        # 塔格 → 塔对象映射（敌人攻击目标查询用）
+        self._towers_by_cell = {
+            (math.floor(t.position[0]), math.floor(t.position[2])): t
+            for t in self.towers if t.active}
+
         # ── 同步新材料化刷怪点 ──
         self._sync_materialized_spawners()
 
@@ -572,6 +674,8 @@ class Game:
                 rt.between_timer -= dt
                 if rt.between_timer <= 0:
                     self._init_spawner_wave(rt, rt.wave_num + 1)
+                    # 已激活刷怪点推进波次时刷新全局阶段（否则 self.wave 冻结）
+                    self._update_global_phase()
             else:
                 rt.spawn_timer -= dt
                 if (rt.spawn_timer <= 0
@@ -584,26 +688,50 @@ class Game:
         presence_r = self._trigger_max_radius("presence")
         if self._spawner_hash_dirty:
             self._rebuild_spawner_hash()
-        for enemy in self.enemies:
-            if not enemy.active:
-                continue
-            if enemy.behavior != "wave":
-                continue  # 侦察兵/侦察回巢不算触发
-            ex, ez = enemy.position[0], enemy.position[2]
-            for sid in self._query_spawner_hash(ex, ez, presence_r):
-                rt = self.spawners.get(sid)
-                if not rt or rt.mode != "dormant":
+        sp_hash = self._spawner_hash
+        if sp_hash:
+            # 帧内按敌人格哈希键记忆查询结果：本循环期间 sp_hash 不被修改
+            #（_enter_scouting 只置脏标记，重建发生在下一帧开头），
+            # 同格敌人共享一次窗口扫描。sid 列表只读，dormant 过滤在下方照旧
+            # 逐敌执行（先触发者改掉 rt.mode 后，同格后续敌人不再命中）。
+            cell = 16
+            r = int(math.ceil(presence_r / cell))
+            floor = math.floor
+            hget = sp_hash.get
+            qmemo = {}
+            mget = qmemo.get
+            for enemy in self.enemies:
+                if not enemy.active:
                     continue
-                sp = self.universe.spawners.get(sid)
-                if sp is None:
-                    continue
-                kr = self._kind_radius_of(sp, "presence")
-                dx = sp.x + 0.5 - ex
-                dz = sp.z + 0.5 - ez
-                if dx * dx + dz * dz <= kr * kr:
-                    self._enter_scouting(rt)
-                    self._spawner_hash_dirty = True
-                    break
+                if enemy.behavior != "wave":
+                    continue  # 侦察兵/侦察回巢不算触发
+                ex, ez = enemy.position[0], enemy.position[2]
+                hx = int(floor(ex)) // cell
+                hz = int(floor(ez)) // cell
+                ck = (hx, hz)
+                near = mget(ck)
+                if near is None:
+                    near = []
+                    for dx in range(-r, r + 1):
+                        for dz in range(-r, r + 1):
+                            bucket = hget((hx + dx, hz + dz))
+                            if bucket:
+                                near.extend(bucket)
+                    qmemo[ck] = near
+                for sid in near:
+                    rt = self.spawners.get(sid)
+                    if not rt or rt.mode != "dormant":
+                        continue
+                    sp = self.universe.spawners.get(sid)
+                    if sp is None:
+                        continue
+                    kr = self._kind_radius_of(sp, "presence")
+                    dx = sp.x + 0.5 - ex
+                    dz = sp.z + 0.5 - ez
+                    if dx * dx + dz * dz <= kr * kr:
+                        self._enter_scouting(rt)
+                        self._spawner_hash_dirty = True
+                        break
 
         # 侦察中点：派出侦察怪 + 最终判定
         for rt in self.spawners.values():
@@ -651,52 +779,106 @@ class Game:
             self.toast_timer -= dt
 
         # ── 更新塔（收集新抛射体 + 战斗事件触发休眠点） ──
+        # Tower.update 返回列表：防御塔挂载多把武器时同帧可各发一弹（攻击叠加）
         new_projectiles = []
+        tower_grid = EnemyGrid(self.enemies) if self.towers else None
         for tower in self.towers:
-            proj = tower.update(dt, self.enemies)
-            if proj:
-                new_projectiles.append(proj)
+            projs = tower.update(dt, self.enemies, tower_grid)
+            if projs:
+                new_projectiles.extend(projs)
                 self._register_combat(tower.position[0], tower.position[2])
         self.projectiles.extend(new_projectiles)
 
-        # ── 更新敌人（传 towers/base 供侦察怪感知） ──
+        # ── 更新敌人（传 towers/base 供侦察怪感知；塔格映射与寻路供 wave 态） ──
         for enemy in self.enemies:
             result = enemy.update(dt, self.universe,
-                                  towers=self.towers, base=self.base)
+                                  towers=self.towers, base=self.base,
+                                  towers_by_cell=self._towers_by_cell,
+                                  pathfinder=self.pathfinder)
             if result == "reached_base":
                 killed = self.base.take_damage(gamedata.ENEMY_GLOBAL.get("base_damage", 5))
                 if killed:
                     self.state = GameState.GAME_OVER
                     return
 
-        # ── 侦察兵遇到正式兵获取信息（侦察兵获得信息回巢，正式兵不受影响） ──
-        scouts = [e for e in self.enemies
-                  if e.active and e.behavior == "scout_wander"]
-        waves = [e for e in self.enemies
-                 if e.active and e.behavior == "wave"]
-        if scouts and waves:
-            for scout in scouts:
-                if not scout.active or scout.behavior != "scout_wander":
-                    continue  # 可能已被前面的循环改为回巢
-                meet_r = gamedata.scout_cfg_of(scout).get("meet_radius", 8.0)
-                meet_r2 = meet_r * meet_r
-                for wave in waves:
-                    if not wave.active:
+        # ── 敌人间碰撞分离（对称推挤，基于空间哈希） ──
+        if len(self.enemies) > 1:
+            sep_grid = EnemyGrid(self.enemies)
+            radius = config.ENEMY_COLLIDE_RADIUS
+            min_d = radius * 2.0
+            min_d2 = min_d * min_d
+            push = config.ENEMY_COLLIDE_STRENGTH * dt
+            enemies = self.enemies
+            grid_query = sep_grid.query
+            for enemy in self.enemies:
+                if not enemy.active:
+                    continue
+                ex, ez = enemy.position[0], enemy.position[2]
+                for idx in grid_query(ex, ez, min_d):
+                    other = enemies[idx]
+                    if other is enemy or not other.active:
                         continue
-                    dx = scout.position[0] - wave.position[0]
-                    dz = scout.position[2] - wave.position[2]
-                    if dx * dx + dz * dz <= meet_r2:
-                        scout.has_message = True
-                        scout._start_return(self.universe)
-                        break
+                    op = other.position
+                    dx = ex - op[0]
+                    # |dx| > min_d ⇒ d² > min_d²，必然被下方 d2 >= min_d2 跳过；
+                    # 提前剔除省掉一次列表索引与三次浮点运算（结果完全一致）
+                    if dx > min_d or -dx > min_d:
+                        continue
+                    dz = ez - op[2]
+                    d2 = dx * dx + dz * dz
+                    if d2 >= min_d2 or d2 < 1e-8:
+                        continue
+                    d = d2 ** 0.5
+                    overlap = (min_d - d) * 0.5 * push
+                    nx_ = dx / d
+                    nz_ = dz / d
+                    enemy.position[0] += nx_ * overlap
+                    enemy.position[2] += nz_ * overlap
+                    op[0] -= nx_ * overlap
+                    op[2] -= nz_ * overlap
+
+        # ── 被摧毁的塔：注销塔格 + 从列表移除 ──
+        destroyed = [t for t in self.towers if not t.active]
+        if destroyed:
+            for t in destroyed:
+                self.universe.remove_tower_cell(math.floor(t.position[0]),
+                                                math.floor(t.position[2]))
+            self.towers = [t for t in self.towers if t.active]
+            self.toast("一座塔被摧毁了！")
+
+        # ── 侦察兵遇到正式兵获取信息（侦察兵获得信息回巢，正式兵不受影响） ──
+        # 常见情形（无侦察兵）只做一次无分配的扫描
+        scouts = []
+        for e in self.enemies:
+            if e.active and e.behavior == "scout_wander":
+                scouts.append(e)
+        if scouts:
+            waves = [e for e in self.enemies
+                     if e.active and e.behavior == "wave"]
+            if waves:
+                for scout in scouts:
+                    if not scout.active or scout.behavior != "scout_wander":
+                        continue  # 可能已被前面的循环改为回巢
+                    meet_r = gamedata.scout_cfg_of(scout).get("meet_radius", 8.0)
+                    meet_r2 = meet_r * meet_r
+                    for wave in waves:
+                        if not wave.active:
+                            continue
+                        dx = scout.position[0] - wave.position[0]
+                        dz = scout.position[2] - wave.position[2]
+                        if dx * dx + dz * dz <= meet_r2:
+                            scout.has_message = True
+                            scout._start_return(self.universe)
+                            break
 
         # ── 更新抛射体 ──
         if self.projectiles:
+            proj_grid = EnemyGrid(self.enemies)
             active_projectiles = []
             for proj in self.projectiles:
                 if not proj.active:
                     continue
-                result = proj.update(dt, self.universe, self.enemies)
+                result = proj.update(dt, self.universe, self.enemies, proj_grid)
                 if result and result.get("hit"):
                     if result.get("killed"):
                         self._award_kill(result["enemy"])
@@ -753,8 +935,17 @@ class Game:
             if self.tech_research_timer <= 0:
                 self._complete_research()
 
+        # 连挖冷却计时
+        if self.dig_hold_timer > 0:
+            self.dig_hold_timer -= dt
+
         # 输入处理
         self._handle_input(dt)
+
+        # 地形编辑批量推进世界版本（一次会话只 bump 一次，寻路变体惰性重估）
+        if self._terrain_edit_pending:
+            self.universe.bump_world_version()
+            self._terrain_edit_pending = False
 
     def _update_tech_panel(self, dt):
         """更新科技树面板状态"""
@@ -847,8 +1038,19 @@ class Game:
 
         # 数字键: 游戏内选择塔类型
         if self.state == GameState.PLAYING:
+            # 放置模式下：1-4 选方块（泥土/石头/沙子/原木）
+            if self.interaction_mode == "place":
+                _placeable = get_placeable_blocks()
+                if rl.IsKeyPressed(rl.KEY_ONE) and len(_placeable) > 0:
+                    self._select_block(_placeable[0].id)
+                elif rl.IsKeyPressed(rl.KEY_TWO) and len(_placeable) > 1:
+                    self._select_block(_placeable[1].id)
+                elif rl.IsKeyPressed(rl.KEY_THREE) and len(_placeable) > 2:
+                    self._select_block(_placeable[2].id)
+                elif rl.IsKeyPressed(rl.KEY_FOUR) and len(_placeable) > 3:
+                    self._select_block(_placeable[3].id)
             # 数字键: 选择经典塔
-            if rl.IsKeyPressed(rl.KEY_ONE):
+            elif rl.IsKeyPressed(rl.KEY_ONE):
                 self._select_tower_type("stone_thrower")
             elif rl.IsKeyPressed(rl.KEY_TWO):
                 self._select_tower_type("water_cannon")
@@ -865,6 +1067,11 @@ class Game:
                 self._select_weapon("iron_sword")
             elif rl.IsKeyPressed(rl.KEY_EIGHT):
                 self._select_weapon("sand_sling")
+            # 9/0: 选择防御塔（无攻击，可挂载武器）
+            elif rl.IsKeyPressed(rl.KEY_NINE):
+                self._select_tower_type("palisade_wall")
+            elif rl.IsKeyPressed(rl.KEY_ZERO):
+                self._select_tower_type("city_wall")
             # B 键: 打开加工/合成面板
             elif rl.IsKeyPressed(rl.KEY_B):
                 self._toggle_craft_panel()
@@ -880,16 +1087,49 @@ class Game:
             # X 键: 切换拆除模式
             elif rl.IsKeyPressed(rl.KEY_X):
                 self._toggle_dismantle()
+            # U 键: 切换收起武器模式（把防御塔上挂着的武器取回背包）
+            elif rl.IsKeyPressed(rl.KEY_U):
+                self._toggle_unmount()
+            # R 键: 切换挖掘模式
+            elif rl.IsKeyPressed(rl.KEY_R):
+                self._toggle_dig()
+            # F 键: 切换放置模式
+            elif rl.IsKeyPressed(rl.KEY_F):
+                self._toggle_place()
+            # M 键: 开关小地图
+            elif rl.IsKeyPressed(rl.KEY_M):
+                self.minimap_visible = not self.minimap_visible
             elif rl.IsKeyPressed(rl.KEY_ESCAPE):
                 self.placing_tower = False
                 self.selected_tower_type = None
                 self.interaction_mode = "none"
                 self.selected_weapon = None
 
-            # 鼠标点击: 优先级链
+            # 鼠标点击: 优先级链（塔栏 → 小地图 → 挖掘 → 放置 → 拆除 → 收起武器 → 放置塔 → 武器 → 拾取）
             if rl.IsMouseButtonPressed(rl.MOUSE_BUTTON_LEFT):
-                if self.interaction_mode == "dismantle":
+                # 塔选择栏优先：点中分段按钮即选中该塔类型（含无热键的星形要塞）
+                tname = self.ui.tower_hit_type(rl.GetMouseX(), rl.GetMouseY())
+                if tname:
+                    self._select_tower_type(tname)
+                elif self.minimap_visible and self.minimap.handle_click(
+                        self, rl.GetMouseX(), rl.GetMouseY()):
+                    pass  # 点击落在小地图上：仅跳转相机
+                elif self.interaction_mode == "dig":
+                    self._try_dig_block()
+                    # 点击帧同步启动连挖冷却，避免同帧 hold 分支再挖一次
+                    # （IsMouseButtonDown && dig_hold_timer<=0 会在按下同帧触发）。
+                    self.dig_hold_timer = config.PLAYER_DIG_COOLDOWN
+                elif self.interaction_mode == "place":
+                    # 方块选择栏点击优先；否则放方块
+                    bname = self.ui.block_bar_hit(rl.GetMouseX(), rl.GetMouseY())
+                    if bname:
+                        self._select_block(bname)
+                    else:
+                        self._try_place_block()
+                elif self.interaction_mode == "dismantle":
                     self._try_dismantle_tower()
+                elif self.interaction_mode == "unmount":
+                    self._try_unmount_weapon_tower()
                 elif self.placing_tower and self.selected_tower_type:
                     self._try_place_tower()
                 elif self.selected_weapon:
@@ -903,26 +1143,49 @@ class Game:
                         if not upgraded:
                             self._try_harvest_prop()
 
+            # 按住左键连挖（dig 模式）
+            if (self.interaction_mode == "dig"
+                    and rl.IsMouseButtonDown(rl.MOUSE_BUTTON_LEFT)
+                    and self.dig_hold_timer <= 0.0):
+                self._try_dig_block()
+                self.dig_hold_timer = config.PLAYER_DIG_COOLDOWN
+
+    def _tower_at_cell(self, x, z, tol=0.6):
+        """返回占据格子 (x, z) 的塔，无则 None。
+
+        塔位是世界坐标（方块中心），故与格子中心 (x+0.5, z+0.5) 比较。
+        tol 为命中容差：点选/升级收紧到 0.6（避免误抓邻格），挂载/拆除放宽到 1.0。
+        """
+        for tower in self.towers:
+            if (abs(tower.position[0] - (x + 0.5)) <= tol
+                    and abs(tower.position[2] - (z + 0.5)) <= tol):
+                return tower
+        return None
+
     def _try_upgrade_tower(self) -> bool:
         """点击已有塔进行升级，返回是否成功"""
         wx, wy, wz = self.camera.screen_to_world(rl.GetMouseX(), rl.GetMouseY())
         x, z = math.floor(wx), math.floor(wz)
-        for tower in self.towers:
-            # 塔位是世界坐标（方块中心），故与格子中心 (x+0.5, z+0.5) 比较
-            # 命中范围收紧到塔自身所在格(中心距 <= 0.6)，避免误抓邻近格的点击
-            if abs(tower.position[0] - (x + 0.5)) <= 0.6 and abs(tower.position[2] - (z + 0.5)) <= 0.6:
-                if tower.level >= config.MAX_TOWER_LEVEL:
-                    self.toast("已达最高等级")
-                    return True
-                cost = tower.upgrade_cost
-                if self.money < cost:
-                    self.toast(f"金钱不足 (需要 {cost})")
-                    return True
-                tower.upgrade()
-                self.money -= cost
-                self.toast(f"升级为 Lv{tower.level}")
-                return True
-        return False
+        tower = self._tower_at_cell(x, z)
+        if tower is None:
+            return False
+        if tower.level >= config.MAX_TOWER_LEVEL:
+            self.toast("已达最高等级")
+            return True
+        cost = tower.upgrade_cost
+        if self.money < cost:
+            self.toast(f"金钱不足 (需要 {cost})")
+            return True
+        tower.upgrade()
+        self.money -= cost
+        msg = f"升级为 Lv{tower.level}"
+        if tower.no_attack and tower.weapon_slots:
+            # 防御塔：附上挂载摘要，便于确认攻击来源
+            names = [m["wdef"].label_cn for m in tower.weapon_mounts]
+            msg += (f" | 挂载 {len(names)}/{tower.weapon_slots}"
+                    + (f"（{', '.join(names)}）" if names else ""))
+        self.toast(msg)
+        return True
 
     def _try_harvest_prop(self):
         """点击采集地表装饰物"""
@@ -979,32 +1242,67 @@ class Game:
         return True
 
     def _try_dismantle_tower(self):
-        """拆除塔并回收材料"""
+        """拆除塔并回收材料（防御塔的挂载武器全额返还背包）"""
         wx, wy, wz = self.camera.screen_to_world(rl.GetMouseX(), rl.GetMouseY())
         x, z = math.floor(wx), math.floor(wz)
-        for i, tower in enumerate(self.towers):
-            if abs(tower.position[0] - (x + 0.5)) <= 1 and abs(tower.position[2] - (z + 0.5)) <= 1:
-                # 获取材料配方
-                if tower.source and tower.source[0] == "weapon":
-                    wdef = WEAPON_TYPES.get(tower.source[1])
-                    recipe = wdef.recipe if wdef else {}
-                else:
-                    recipe = CLASSIC_TOWER_MATERIALS.get(tower.source[1] if tower.source else "", {})
-                # 回收材料
-                refund = dismantle_refund(recipe)
-                for mat, amt in refund.items():
-                    self.inventory.add_material(mat, amt)
-                self.towers.pop(i)
-                self.toast("已拆除，材料已回收")
-                return
-        self.toast("未找到可拆除的塔")
+        tower = self._tower_at_cell(x, z, tol=1.0)
+        if tower is None:
+            self.toast("未找到可拆除的塔")
+            return
+        self.towers.remove(tower)
+        # 获取材料配方
+        if tower.source and tower.source[0] == "weapon":
+            wdef = WEAPON_TYPES.get(tower.source[1])
+            recipe = wdef.recipe if wdef else {}
+        else:
+            recipe = CLASSIC_TOWER_MATERIALS.get(tower.source[1] if tower.source else "", {})
+        # 回收材料
+        refund = dismantle_refund(recipe)
+        for mat, amt in refund.items():
+            self.inventory.add_material(mat, amt)
+        # 防御塔挂载的武器全额返还（玩家主动拆除；被敌人摧毁则损失）
+        got_weapons = []
+        for mount in tower.weapon_mounts:
+            self.inventory.add_weapon(mount["wdef"].name, 1)
+            got_weapons.append(mount["wdef"].label_cn)
+        # 注销塔格（旧版遗漏 → 拆塔后路径仍永久绕行）
+        self.universe.remove_tower_cell(
+            math.floor(tower.position[0]), math.floor(tower.position[2]))
+        self.toast("已拆除，材料已回收"
+                   + (f"，返还 {', '.join(got_weapons)}" if got_weapons else ""))
 
     def _try_place_weapon_tower(self):
-        """放置武器塔"""
+        """放置武器塔；若点击的是已放置的防御塔，则把武器挂载上去
+
+        防御塔自身无攻击，攻击效果来自挂载的武器（可同时挂多把，攻击叠加）。
+        """
         if not self.selected_weapon:
             return
         wx, wy, wz = self.camera.screen_to_world(rl.GetMouseX(), rl.GetMouseY())
         x, z = math.floor(wx), math.floor(wz)
+
+        # ── 命中防御塔：走挂载而非放置 ──
+        wall_tower = self._tower_at_cell(x, z, tol=1.0)
+        if wall_tower is not None and wall_tower.no_attack:
+            if wall_tower.weapon_slots <= 0:
+                self.toast("该防御塔无武器槽")
+                return
+            if len(wall_tower.weapon_mounts) >= wall_tower.weapon_slots:
+                self.toast(f"挂载已满 ({wall_tower.weapon_slots}/{wall_tower.weapon_slots})")
+                return
+            if not self.inventory.remove_weapon(self.selected_weapon.name, 1):
+                self.toast("背包中没有该武器")
+                return
+            wall_tower.mount_weapon(self.selected_weapon,
+                                    damage_mult=self.tech_damage_mult())
+            self.toast(f"已挂载 {self.selected_weapon.label_cn} "
+                       f"({len(wall_tower.weapon_mounts)}/{wall_tower.weapon_slots})")
+            self.selected_weapon = None
+            self.placing_tower = False
+            self.selected_tower_type = None
+            self.interaction_mode = "none"
+            return
+
         if not self._is_valid_placement(x, z):
             self.toast("无法在此放置")
             return
@@ -1013,7 +1311,7 @@ class Game:
             self.toast(f"安装费不足 (需要 {install_fee})")
             return
         if self.inventory.remove_weapon(self.selected_weapon.name, 1):
-            y = self.universe.get_surface_height(x, z) + 1
+            y = self.universe.surface_height_at(x, z) + 1
             tower = Tower.from_weapon(self.selected_weapon, (x + 0.5, y, z + 0.5),
                                        damage_mult=self.tech_damage_mult())
             self.towers.append(tower)
@@ -1046,6 +1344,30 @@ class Game:
             self.selected_tower_type = None
             self.selected_weapon = None
 
+    def _try_unmount_weapon_tower(self):
+        """收起防御塔上的挂载武器并返还背包。
+
+        普通左键 = 取下最后挂载的那把（LIFO）；Shift+左键 = 全部取下。
+        取下只是从槽位回到背包，塔体不受影响。
+        """
+        wx, wy, wz = self.camera.screen_to_world(rl.GetMouseX(), rl.GetMouseY())
+        x, z = math.floor(wx), math.floor(wz)
+        tower = self._tower_at_cell(x, z, tol=1.0)
+        if tower is None:
+            self.toast("未找到可收起武器的塔")
+            return
+        if tower.weapon_slots <= 0 or not tower.weapon_mounts:
+            self.toast("该塔没有挂载武器")
+            return
+        if self._shift_down():
+            wdefs = tower.unmount_all()
+        else:
+            wdefs = [tower.unmount_weapon(-1)]
+        for w in wdefs:
+            self.inventory.add_weapon(w.name, 1)
+        self.toast("已收起 " + "、".join(w.label_cn for w in wdefs)
+                   + f"（剩余 {len(tower.weapon_mounts)}/{tower.weapon_slots}）")
+
     def _toggle_dismantle(self):
         """切换拆除模式"""
         if self.interaction_mode == "dismantle":
@@ -1057,6 +1379,114 @@ class Game:
             self.selected_tower_type = None
             self.selected_weapon = None
             self.toast("拆除模式开启 - 点击塔拆除")
+
+    def _toggle_unmount(self):
+        """切换收起武器模式（把防御塔上的武器取回背包，Shift = 全部）"""
+        if self.interaction_mode == "unmount":
+            self.interaction_mode = "none"
+            self.toast("收起武器模式关闭")
+        else:
+            self.interaction_mode = "unmount"
+            self.placing_tower = False
+            self.selected_tower_type = None
+            self.selected_weapon = None
+            self.toast("收起武器模式开启 - 点击防御塔取回武器（Shift=全部）")
+
+    def _toggle_dig(self):
+        """切换玩家挖掘模式（R 键）"""
+        if self.interaction_mode == "dig":
+            self.interaction_mode = "none"
+            self.toast("挖掘模式关闭")
+        else:
+            self.interaction_mode = "dig"
+            self.placing_tower = False
+            self.selected_tower_type = None
+            self.selected_weapon = None
+            self.selected_block_id = None
+            self.toast("挖掘模式开启 - 左键挖方块并收获材料")
+
+    def _toggle_place(self):
+        """切换玩家放置模式（F 键）"""
+        if self.interaction_mode == "place":
+            self.interaction_mode = "none"
+            self.toast("放置模式关闭")
+        else:
+            self.interaction_mode = "place"
+            self.placing_tower = False
+            self.selected_tower_type = None
+            self.selected_weapon = None
+            if self.selected_block_id is None:
+                blocks = get_placeable_blocks()
+                if blocks:
+                    self.selected_block_id = blocks[0].id
+            self.toast("放置模式开启 - [1]泥土 [2]石头 [3]沙子 [4]原木 选择方块")
+
+    def _select_block(self, block_id):
+        """选择放置方块（1-4 数字键或方块栏点击）。"""
+        bdef = get_block_by_name(BLOCK_NAME[block_id])
+        if bdef is None or not bdef.placeable:
+            return
+        self.selected_block_id = block_id
+        self.toast(f"放置方块: {bdef.name}")
+
+    def _try_dig_block(self):
+        """玩家挖掉鼠标所指列顶方块并收获材料。"""
+        wx, wy, wz = self.camera.screen_to_world(rl.GetMouseX(), rl.GetMouseY())
+        x, z = math.floor(wx), math.floor(wz)
+        if self._tower_at_cell(x, z, tol=0.6) is not None:
+            self.toast("不能挖塔脚下的方块")
+            return
+        if abs(x - self.universe.base_x) <= 2 and abs(z - self.universe.base_z) <= 2:
+            self.toast("不能挖大本营附近的方块")
+            return
+        top_id = self.universe.break_block(x, z)
+        if top_id == 0:
+            self.toast("此处不可挖")
+            return
+        bdef = get_block_by_name(BLOCK_NAME.get(top_id, "air"))
+        if bdef is not None and bdef.harvest_material:
+            self.inventory.add_material(bdef.harvest_material, bdef.harvest_amount)
+            self.toast(f"+{bdef.harvest_amount} "
+                       f"{MATERIAL_NAMES_CN.get(bdef.harvest_material, bdef.harvest_material)}")
+        else:
+            self.toast("已挖开（无收获）")
+        # 挖方是活动事件：唤醒附近休眠刷怪点 + 让附近侦察兵获信息回巢
+        self._register_edit(x, z)
+        self._notify_scouts_of_edit(x, z)
+        self._terrain_edit_pending = True
+
+    def _try_place_block(self):
+        """玩家在鼠标所指列顶放置方块并消耗材料。"""
+        if self.selected_block_id is None:
+            self.toast("未选择方块")
+            return
+        bdef = get_block_by_name(BLOCK_NAME.get(self.selected_block_id, "air"))
+        if bdef is None or not bdef.placeable:
+            self.toast("该方块不可放置")
+            return
+        wx, wy, wz = self.camera.screen_to_world(rl.GetMouseX(), rl.GetMouseY())
+        x, z = math.floor(wx), math.floor(wz)
+        if not self._is_valid_placement(x, z):
+            self.toast("无法在此放置")
+            return
+        mat = bdef.place_material or bdef.harvest_material
+        if not mat or not self.inventory.remove_material(mat, 1):
+            self.toast(f"缺少材料: {MATERIAL_NAMES_CN.get(mat, mat)}")
+            return
+        if not self.universe.place_block(x, z, self.selected_block_id):
+            self.inventory.add_material(mat, 1)  # 退还（放置失败）
+            self.toast("放置失败（高度上限或地形不可放置）")
+            return
+        self.toast(f"已放置 {bdef.name} (-1 {MATERIAL_NAMES_CN.get(mat, mat)})")
+        # 放方是活动事件：唤醒附近休眠刷怪点 + 让附近侦察兵获信息回巢
+        self._register_edit(x, z)
+        self._notify_scouts_of_edit(x, z)
+        self._terrain_edit_pending = True
+
+    @staticmethod
+    def _shift_down():
+        """Shift 是否按下（左右 Shift 都算）"""
+        return rl.IsKeyDown(rl.KEY_LEFT_SHIFT) or rl.IsKeyDown(rl.KEY_RIGHT_SHIFT)
 
     def _craft_panel_action(self, action_type: str, target: str):
         """加工面板内的操作（科技前置在 data/*.json 的 requires_tech 字段）"""
@@ -1138,6 +1568,9 @@ class Game:
 
         self.selected_tower_type = tower_type
         self.placing_tower = True
+        # 切出武器放置/拆除等互斥模式（键盘与塔栏点击两条路径共用）
+        self.selected_weapon = None
+        self.interaction_mode = "none"
 
     def _select_weapon(self, weapon_name):
         """选择武器装备放置"""
@@ -1181,14 +1614,15 @@ class Game:
             return
 
         # 放置塔（应用科技伤害加成）
-        # 用纯噪声查询：放置点击不该触发区块生成 / LRU 淘汰
-        y = self.universe._surface_height_pure(x, z) + 1
+        # 覆盖层感知：挖低/垫高后的地形上塔也坐落正确（surface_height_at 为
+        # dict+纯噪声查表，不触发区块生成 / LRU 淘汰）
+        y = self.universe.surface_height_at(x, z) + 1
         tower = Tower(self.selected_tower_type, (x + 0.5, y, z + 0.5),
                       damage_mult=self.tech_damage_mult())
         self.towers.append(tower)
         self.money -= cost
-        # 注册塔格（延迟路径绕行）
-        self.universe.add_tower_cell(x, z)
+        # 注册塔格（延迟路径绕行）；防御塔额外登记为墙格（寻路近乎不可通行）
+        self.universe.add_tower_cell(x, z, is_wall=tower.no_attack)
 
         # 造塔触发：检查附近休眠点
         self._register_build(tower.position[0], tower.position[2])
@@ -1198,7 +1632,11 @@ class Game:
         self.selected_tower_type = None
 
     def _is_valid_placement(self, x, z):
-        """检查放置位置是否有效（无限地形，无边界限制）"""
+        """检查放置位置是否有效（无限地形，无边界限制）。
+
+        允许放在路径上挡路（敌人会绕行/拆塔/挖地）；
+        仍禁止：海洋、大本营区、与既有塔重叠、敌人正脚下（防卡死）。
+        """
         # 不能放在海洋/水下（纯噪声判定：与 chunk 水柱阈值 h<0.20 一致，
         # 比 biome 标签的 0.18 略严格，避免塔落在浅水里；也不用 get_biome_safe，
         # 它在区块未加载时默认返回 plains 会漏判）
@@ -1209,13 +1647,17 @@ class Game:
         if abs(x - self.universe.base_x) <= 2 and abs(z - self.universe.base_z) <= 2:
             return False
 
-        # 不能放在任何路径上（O(1) 查找）
-        if self.universe._is_on_path(x, z):
-            return False
-
         # 不能放在已有塔的位置
         for tower in self.towers:
             if abs(tower.position[0] - (x + 0.5)) < 1 and abs(tower.position[2] - (z + 0.5)) < 1:
+                return False
+
+        # 不能放在敌人正脚下（敌人会被卡在塔里）
+        for enemy in self.enemies:
+            if not enemy.active:
+                continue
+            if (abs(enemy.position[0] - (x + 0.5)) < 1.2
+                    and abs(enemy.position[2] - (z + 0.5)) < 1.2):
                 return False
 
         return True
@@ -1225,7 +1667,12 @@ class Game:
         begin_drawing()
 
         # 渲染世界（预览/高亮在相机上下文内渲染）
+        # 挖掘产生的脏区块转给渲染器（下一帧重建网格）
+        if self.universe.dirty_chunks:
+            self.renderer.mark_chunks_dirty(self.universe.dirty_chunks)
+            self.universe.dirty_chunks.clear()
         entities = {
+            "game": self,
             "towers": self.towers,
             "enemies": self.enemies,
             "projectiles": self.projectiles,
@@ -1234,21 +1681,28 @@ class Game:
                           for rt in self.spawners.values()
                           if self.universe.spawners.get(rt.spawner_id)],
         }
-        # 构建相机内额外渲染回调（放置预览 + 拆除高亮）
+        # 构建相机内额外渲染回调（放置预览 + 拆除高亮 + 方块编辑预览）
         _need_preview = (self.placing_tower and self.selected_tower_type) or self.selected_weapon
         _need_dismantle = (self.interaction_mode == "dismantle")
+        _need_block_edit = self.interaction_mode in ("dig", "place")
         camera_extra = None
-        if _need_preview or _need_dismantle:
+        if _need_preview or _need_dismantle or _need_block_edit:
             def camera_extra():
                 if _need_preview:
                     self.ui.render_placement_preview(self)
                 if _need_dismantle:
                     self.ui.render_dismantle_highlight(self)
+                if _need_block_edit:
+                    self.ui.render_block_edit_preview(self)
 
         self.renderer.render(self.camera, self.universe, entities, camera_extra)
 
         # 渲染 HUD
         self.ui.render_hud(self)
+
+        # 渲染小地图（HUD 之上、面板之下；面板打开时会被自然盖住）
+        if self.minimap_visible:
+            self.minimap.render(self)
 
         # 渲染波次公告
         if self.wave_announcement_timer > 0:
@@ -1315,7 +1769,7 @@ class Game:
             if self.save_menu_index > 0:
                 self.save_menu_index -= 1
         elif rl.IsKeyPressed(rl.KEY_DOWN) or rl.IsKeyPressed(rl.KEY_S):
-            max_idx = 1 + len(self.save_menu_items)  # 0=新建, 1..n=存档
+            max_idx = len(self.save_menu_items)  # 0=新建, 1..n=存档，下标上限 n
             if self.save_menu_index < max_idx:
                 self.save_menu_index += 1
 

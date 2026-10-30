@@ -118,6 +118,10 @@ TERRAIN_SPEED_MULTS = ENEMIES_DATA.get("terrain_speed", {})
 ENEMY_COLORS = {name: _color(ed["color"]) for name, ed in ENEMIES_RAW.items()}
 ENEMY_PERSONALITIES = {
     name: dict(ed.get("personality", {})) for name, ed in ENEMIES_RAW.items()}
+ENEMY_ENVIRONMENTS = {
+    name: dict(ed.get("environment", {})) for name, ed in ENEMIES_RAW.items()}
+ENEMY_ATTACKS = {
+    name: dict(ed.get("attack", {})) for name, ed in ENEMIES_RAW.items()}
 # 掉落表：{敌人类型: [(材料, 数量), ...]}
 DROP_TABLES = {
     name: [tuple(d) for d in ed.get("drops", [["wood", 1]])]
@@ -127,6 +131,7 @@ DROP_TABLES = {
 # ─── 塔 ───────────────────────────────────────────────────────
 TOWERS_RAW = TOWERS_DATA["towers"]     # name → 全部塔属性
 TOWER_COLORS = {name: _color(td["color"]) for name, td in TOWERS_RAW.items()}
+TOWER_HP = {name: td.get("base_hp", 100) for name, td in TOWERS_RAW.items()}
 # 经典塔拆除回收材料（从 towers.json 的 materials 字段派生）
 CLASSIC_TOWER_MATERIALS = {
     name: dict(td.get("materials", {})) for name, td in TOWERS_RAW.items()}
@@ -335,6 +340,10 @@ def _collect_data_issues():
 
     # ── 敌人 ──
     enemy_names = set(ENEMIES_RAW)
+    # 群系/方块名注册表（blocks/biomes 为纯数据模块，无循环依赖）
+    from blocks import BLOCK_NAME
+    from biomes import BIOMES as _BIOME_NAMES
+    block_names = set(BLOCK_NAME.values())
     for ename, ed in ENEMIES_RAW.items():
         for f in ("base_health", "base_speed", "base_reward"):
             if not isinstance(ed.get(f), (int, float)) or ed[f] <= 0:
@@ -345,6 +354,35 @@ def _collect_data_issues():
         for f in ("direct", "terrain_aware", "aggressive", "wobble"):
             if f not in pers:
                 bad(f"enemy[{ename}].personality 缺少键 {f}")
+        # 寻路偏好（有默认值，缺失不报错，值非法才报错）
+        if "climb_limit" in pers and (not isinstance(pers["climb_limit"], (int, float)) or pers["climb_limit"] <= 0):
+            bad(f"enemy[{ename}].personality.climb_limit 非法: {pers['climb_limit']!r}")
+        if "dig_speed" in pers and (not isinstance(pers["dig_speed"], (int, float)) or pers["dig_speed"] < 0):
+            bad(f"enemy[{ename}].personality.dig_speed 非法: {pers['dig_speed']!r}")
+        for f in ("crowd_avoidance", "tower_hostility"):
+            if f in pers and (not isinstance(pers[f], (int, float)) or not 0.0 <= pers[f] <= 1.0):
+                bad(f"enemy[{ename}].personality.{f} 应在 [0,1]: {pers[f]!r}")
+        if "detour_tolerance" in pers and (not isinstance(pers["detour_tolerance"], (int, float)) or pers["detour_tolerance"] < 1.0):
+            bad(f"enemy[{ename}].personality.detour_tolerance 应 ≥1.0: {pers['detour_tolerance']!r}")
+        env = ed.get("environment") or {}
+        ws = env.get("weather_speed") or {}
+        for f in ("rain", "snow"):
+            if f in ws and (not isinstance(ws[f], (int, float)) or not 0.0 < ws[f] <= 2.0):
+                bad(f"enemy[{ename}].environment.weather_speed.{f} 应在 (0,2]: {ws[f]!r}")
+        for b, mult in (env.get("terrain_speed") or {}).items():
+            if b not in _BIOME_NAMES:
+                bad(f"enemy[{ename}].environment.terrain_speed 引用了不存在的群系: {b!r}")
+            if not isinstance(mult, (int, float)) or mult <= 0:
+                bad(f"enemy[{ename}].environment.terrain_speed[{b}] 非法: {mult!r}")
+        for blk, mult in (env.get("surface_affinity") or {}).items():
+            if blk not in block_names:
+                bad(f"enemy[{ename}].environment.surface_affinity 引用了不存在的方块: {blk!r}")
+            if not isinstance(mult, (int, float)) or mult <= 0:
+                bad(f"enemy[{ename}].environment.surface_affinity[{blk}] 非法: {mult!r}")
+        atk = ed.get("attack") or {}
+        for f in ("damage", "cooldown", "range"):
+            if f in atk and (not isinstance(atk[f], (int, float)) or atk[f] <= 0):
+                bad(f"enemy[{ename}].attack.{f} 非法: {atk.get(f)!r}")
         drops = ed.get("drops") or []
         if not drops:
             bad(f"enemy[{ename}].drops 为空")
@@ -366,9 +404,19 @@ def _collect_data_issues():
 
     # ── 塔 ──
     for tn, tdef in TOWERS_RAW.items():
+        no_atk = bool(tdef.get("no_attack", False))
+        if not isinstance(tdef.get("no_attack", False), bool):
+            bad(f"tower[{tn}].no_attack 应为布尔: {tdef.get('no_attack')!r}")
+        # 攻击属性：防御塔(no_attack)允许 0(永不索敌开火)；攻击塔仍须 >0
         for f in ("base_damage", "base_range", "base_cooldown", "base_cost"):
-            if not isinstance(tdef.get(f), (int, float)) or tdef[f] <= 0:
+            v = tdef.get(f)
+            if not isinstance(v, (int, float)) or (v < 0 if no_atk else v <= 0):
                 bad(f"tower[{tn}].{f} 非法: {tdef.get(f)!r}")
+        ws = tdef.get("weapon_slots", 0)
+        if not isinstance(ws, int) or isinstance(ws, bool) or ws < 0:
+            bad(f"tower[{tn}].weapon_slots 非法: {ws!r}")
+        if not isinstance(tdef.get("base_hp", 100), (int, float)) or tdef.get("base_hp", 100) <= 0:
+            bad(f"tower[{tn}].base_hp 非法: {tdef.get('base_hp')!r}")
         if not _valid_color(tdef.get("color")):
             bad(f"tower[{tn}].color 非法: {tdef.get('color')!r}")
         for t in tdef.get("requires_tech", []) or []:
@@ -408,7 +456,7 @@ def _collect_data_issues():
             else:
                 covered_biomes[b] = kname
         tr = kd.get("trigger_radii") or {}
-        for f in ("presence", "build", "combat"):
+        for f in ("presence", "build", "combat", "edit"):
             if not isinstance(tr.get(f), (int, float)) or tr[f] <= 0:
                 bad(f"spawners.kinds[{kname}].trigger_radii.{f} 非法: {tr.get(f)!r}")
         sc = kd.get("scout") or {}
@@ -418,7 +466,7 @@ def _collect_data_issues():
             bad(f"spawners.kinds[{kname}].scout.batch 非法: {sc.get('batch')!r}")
         for f in ("perception_radius", "wander_duration", "wander_speed_mult",
                   "turn_interval", "wander_turn", "noise_bias", "noise_jitter",
-                  "probe_dist", "meet_radius"):
+                  "probe_dist", "meet_radius", "edit_radius"):
             if not isinstance(sc.get(f), (int, float)) or sc[f] <= 0:
                 bad(f"spawners.kinds[{kname}].scout.{f} 缺失或非法: {sc.get(f)!r}")
 

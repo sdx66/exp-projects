@@ -1,5 +1,5 @@
 {
-  "comment": "敌人数据。运行时由 gamedata.py 读取并构建 entities.ENEMY_TYPES / 掉落表 / 地形速度。\nglobal: 跨类型的全局参数。types: 每类 base_health/base_speed/base_reward + color + personality + drops[[材料,数量],...]。\nterrain_speed: 各生物群系对敌人速度的倍率。",
+  "comment": "敌人数据。运行时由 gamedata.py 读取并构建 entities.ENEMY_TYPES / 掉落表 / 地形速度。\nglobal: 跨类型的全局参数。types: 每类 base_health/base_speed/base_reward + color + personality + environment + attack + drops[[材料,数量],...]。\nterrain_speed: 各生物群系对敌人速度的全局默认倍率（类型 environment.terrain_speed 可逐类型覆盖）。\npersonality（连续数值，寻路偏好）: direct 直线偏好 / terrain_aware 地形敏感(坡度代价系数) / aggressive 侵略性 / wobble 摆动幅度 /\n  climb_limit 可攀爬高差上限(格,超出需挖掘或绕行) / dig_speed 挖掘速度(块/秒,0=不可挖) /\n  crowd_avoidance 拥挤厌恶(0=喜欢扎堆,1=极力避开) / detour_tolerance 绕远容忍(可接受路程/直线距离比) /\n  tower_hostility 拆塔意愿(0=绕开塔,1=乐于拆塔)。\nenvironment（按类型的气候/地面响应）: weather_speed.rain|.snow 满强度雨/雪时的速度倍率(随强度连续插值) /\n  terrain_speed 覆盖全局群系倍率 / surface_affinity 按表面方块的速度倍率。\nattack: 近战攻击塔的 damage/cooldown(秒)/range(格)。",
   "global": {
     "base_damage": 5,
     "health_growth": 1.08,
@@ -21,7 +21,17 @@
       "base_speed": 2.0,
       "base_reward": 10,
       "color": [180, 60, 60],
-      "personality": {"direct": 0.5, "terrain_aware": 0.5, "aggressive": 0.5, "wobble": 0.5},
+      "personality": {
+        "direct": 0.5, "terrain_aware": 0.5, "aggressive": 0.5, "wobble": 0.5,
+        "climb_limit": 1.5, "dig_speed": 0.6, "crowd_avoidance": 0.5,
+        "detour_tolerance": 1.5, "tower_hostility": 0.35
+      },
+      "environment": {
+        "weather_speed": {"rain": 0.9, "snow": 0.85},
+        "terrain_speed": {},
+        "surface_affinity": {"snow": 0.85, "sand": 0.95, "ice": 0.75, "gravel": 0.9}
+      },
+      "attack": {"damage": 4, "cooldown": 1.2, "range": 1.4},
       "drops": [["wood", 2], ["stone", 2], ["hide", 1]]
     },
     "fast": {
@@ -29,7 +39,17 @@
       "base_speed": 4.0,
       "base_reward": 8,
       "color": [220, 150, 40],
-      "personality": {"direct": 0.9, "terrain_aware": 0.2, "aggressive": 0.8, "wobble": 0.8},
+      "personality": {
+        "direct": 0.9, "terrain_aware": 0.2, "aggressive": 0.8, "wobble": 0.8,
+        "climb_limit": 1.0, "dig_speed": 0.2, "crowd_avoidance": 0.15,
+        "detour_tolerance": 1.25, "tower_hostility": 0.15
+      },
+      "environment": {
+        "weather_speed": {"rain": 0.8, "snow": 0.7},
+        "terrain_speed": {"plains": 1.35, "savanna": 1.2, "desert": 1.25},
+        "surface_affinity": {"snow": 0.7, "sand": 1.0, "ice": 0.6, "grass": 1.05, "gravel": 0.85}
+      },
+      "attack": {"damage": 2, "cooldown": 1.0, "range": 1.3},
       "drops": [["sand", 1], ["wood", 1], ["fat", 1]]
     },
     "tank": {
@@ -37,7 +57,17 @@
       "base_speed": 1.0,
       "base_reward": 25,
       "color": [100, 80, 160],
-      "personality": {"direct": 0.2, "terrain_aware": 0.9, "aggressive": 0.3, "wobble": 0.3},
+      "personality": {
+        "direct": 0.2, "terrain_aware": 0.9, "aggressive": 0.3, "wobble": 0.3,
+        "climb_limit": 2.5, "dig_speed": 1.5, "crowd_avoidance": 0.9,
+        "detour_tolerance": 1.9, "tower_hostility": 0.85
+      },
+      "environment": {
+        "weather_speed": {"rain": 1.0, "snow": 0.95},
+        "terrain_speed": {"mountain": 0.8},
+        "surface_affinity": {"snow": 0.95, "sand": 0.9, "ice": 0.9, "gravel": 0.95}
+      },
+      "attack": {"damage": 10, "cooldown": 2.0, "range": 1.5},
       "drops": [["iron_ore", 1], ["copper_ore", 1], ["stone", 3], ["bone", 1], ["hide", 2]]
     }
   }

@@ -2,6 +2,7 @@
   "comment": "配方与物品数据。运行时由 gamedata.py 读取。\nmaterials: 材料定义 class=raw|processed + color + name_cn。\nprocessing: 加工配方 key=规则名; hand/tool=徒手/工具产量(hand=0 徒手不可),\ntime_hand/time_tool 耗时, requires_tool 必需工具, requires_tech 科技前置。\ntools: 工具合成配方; weapons: 武器合成配方(可装备为塔); 均支持 requires_tech。\ndismantle_refund: 拆塔回收比例。",
   "dismantle_refund": 0.5,
   "materials": {
+    "dirt": {"class": "raw", "color": [121, 85, 72], "name_cn": "泥土"},
     "wood": {"class": "raw", "color": [140, 100, 50], "name_cn": "木材"},
     "stone": {"class": "raw", "color": [145, 145, 145], "name_cn": "石料"},
     "sand": {"class": "raw", "color": [219, 207, 163], "name_cn": "沙子"},

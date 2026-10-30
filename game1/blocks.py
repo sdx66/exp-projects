@@ -53,6 +53,11 @@ class BlockDef:
     temp_max: float = 100.0
     # 纹理噪声参数（用于动态纹理生成）
     texture_noise: float = 0.0   # 0=纯色, >0=噪声强度
+    # 玩家挖掘/放置
+    harvest_material: Optional[str] = None  # 挖掉所得材料名，None=不可挖
+    harvest_amount: int = 0
+    placeable: bool = False            # 可被玩家放置
+    place_material: Optional[str] = None  # 放置消耗材料，None→用 harvest_material
 
 # ─── 方块注册表 ────────────────────────────────────────────
 
@@ -76,6 +81,7 @@ _register(BlockDef(
     solid=True, biomes=("forest", "plains", "savanna"),
     temp_min=0.0, temp_max=35.0,
     texture_noise=0.15,
+    harvest_material="dirt", harvest_amount=1,
 ))
 
 _register(BlockDef(
@@ -83,6 +89,8 @@ _register(BlockDef(
     top_color=(121, 85, 72), side_color=(121, 85, 72), bottom_color=(121, 85, 72),
     solid=True, biomes=("all",),
     texture_noise=0.20,
+    harvest_material="dirt", harvest_amount=1,
+    placeable=True, place_material="dirt",
 ))
 
 _register(BlockDef(
@@ -90,6 +98,8 @@ _register(BlockDef(
     top_color=(145, 145, 145), side_color=(120, 120, 120), bottom_color=(95, 95, 95),
     solid=True, biomes=("all",),
     texture_noise=0.25,
+    harvest_material="stone", harvest_amount=1,
+    placeable=True, place_material="stone",
 ))
 
 _register(BlockDef(
@@ -98,6 +108,8 @@ _register(BlockDef(
     solid=True, biomes=("desert", "beach", "river"),
     temp_min=10.0, temp_max=50.0,
     texture_noise=0.10,
+    harvest_material="sand", harvest_amount=1,
+    placeable=True, place_material="sand",
 ))
 
 _register(BlockDef(
@@ -114,6 +126,7 @@ _register(BlockDef(
     solid=True, biomes=("tundra", "snowy", "mountain"),
     temp_min=-100.0, temp_max=0.0,
     texture_noise=0.05,
+    harvest_material="dirt", harvest_amount=1,
 ))
 
 _register(BlockDef(
@@ -146,6 +159,7 @@ _register(BlockDef(
     top_color=(160, 140, 120), side_color=(140, 120, 100), bottom_color=(120, 100, 80),
     solid=True, biomes=("mountain", "stone"),
     texture_noise=0.35,
+    harvest_material="iron_ore", harvest_amount=1,
 ))
 
 _register(BlockDef(
@@ -153,6 +167,7 @@ _register(BlockDef(
     top_color=(80, 80, 80), side_color=(70, 70, 70), bottom_color=(60, 60, 60),
     solid=True, biomes=("mountain", "stone"),
     texture_noise=0.35,
+    harvest_material="iron_ore", harvest_amount=1,  # 煤矿也产铁（简化）
 ))
 
 _register(BlockDef(
@@ -167,6 +182,7 @@ _register(BlockDef(
     top_color=(130, 125, 120), side_color=(110, 105, 100), bottom_color=(90, 85, 80),
     solid=True, biomes=("mountain", "desert"),
     texture_noise=0.30,
+    harvest_material="stone", harvest_amount=1,
 ))
 
 _register(BlockDef(
@@ -174,6 +190,8 @@ _register(BlockDef(
     top_color=(120, 90, 50), side_color=(100, 75, 40), bottom_color=(120, 90, 50),
     solid=True, biomes=("forest",),
     texture_noise=0.20,
+    harvest_material="wood", harvest_amount=1,
+    placeable=True, place_material="wood",
 ))
 
 _register(BlockDef(
@@ -201,3 +219,12 @@ def is_solid(id: int) -> bool:
 def is_transparent(id: int) -> bool:
     """方块是否透明"""
     return BLOCKS.get(id, BLOCKS[0]).transparent
+
+def get_placeable_blocks() -> list:
+    """可放置方块列表（固定顺序，供方块选择栏）。"""
+    return [
+        BLOCKS[BLOCK_ID["dirt"]],
+        BLOCKS[BLOCK_ID["stone"]],
+        BLOCKS[BLOCK_ID["sand"]],
+        BLOCKS[BLOCK_ID["log"]],
+    ]

@@ -379,14 +379,29 @@ class TechTreePanel:
             "soft":  color(120, 120, 140, 150),   # 概念级软依赖(半透明)
             "ach":   color(100, 140, 180, 255),   # 成果间依赖
         }
+        # 逐帧常量：graph_to_screen 仅依赖 view 的 zoom/pan（一次渲染内不变），
+        # 内联成同序的 乘加；edge 颜色只依赖 (kind, span)（_current_alpha 本次
+        # 渲染内不变），按 (kind, span) 缓存，与逐条重算逐位一致。
+        zoom = self.view.zoom
+        pan_x = self.view.pan_x
+        pan_y = self.view.pan_y
+        edge_fade = tt.edge_fade
+        color_cache = {}
+        cget = color_cache.get
         for edge in edges:
             x1, y1, x2, y2 = edge[:4]
             kind = edge[4] if len(edge) > 4 else "tree"
             span = edge[5] if len(edge) > 5 else 1
-            r, g, b, a = bases.get(kind, bases["tree"])
-            c = color(r, g, b, int(a * tt.edge_fade(span)))
-            sx1, sy1 = tt.graph_to_screen(self.view, x1, y1)
-            sx2, sy2 = tt.graph_to_screen(self.view, x2, y2)
+            ck = (kind, span)
+            c = cget(ck)
+            if c is None:
+                r, g, b, a = bases.get(kind, bases["tree"])
+                c = color(r, g, b, int(a * edge_fade(span)))
+                color_cache[ck] = c
+            sx1 = x1 * zoom + pan_x
+            sy1 = y1 * zoom + pan_y
+            sx2 = x2 * zoom + pan_x
+            sy2 = y2 * zoom + pan_y
             draw_line(sx1, sy1, sx2, sy2, c)
 
     def _render_nodes(self, tree, positions, edges, font, viewport_w, viewport_h,
@@ -414,7 +429,7 @@ class TechTreePanel:
                 state = tree.achievement_state(node_id, unlocked_tech or set())
 
             # 节点颜色
-            bg = self._node_color(state)
+            bg = self._node_color(state, is_ach=(self.page == tt.PAGE_ACHIEVEMENTS))
 
             # 绘制背景
             draw_rect(int(sx), int(sy), int(sw), int(sh), bg)
@@ -463,22 +478,28 @@ class TechTreePanel:
                                  sy + (sh - info_size) / 2,
                                  info_size, color(200, 200, 200))
 
-    def _node_color(self, state):
-        """节点背景色。"""
+    def _node_color(self, state, is_ach=False):
+        """节点背景色。
+
+        is_ach 为成就页时用成就配色；否则用科技配色。
+        注意 STATE_* 与 ACH_* 共用同一字符串（unlocked/locked），
+        必须按页面分流，否则成就页解锁/锁定节点永远命中科技配色分支。
+        """
+        if is_ach:
+            if state == tt.ACH_UNLOCKED:
+                return color(*ui.TECHTREE_ACH_UNLOCKED)
+            elif state == tt.ACH_PARTIAL:
+                return color(*ui.TECHTREE_ACH_PARTIAL)
+            else:
+                return color(*ui.TECHTREE_ACH_LOCKED)
         if state == tt.STATE_UNLOCKED:
             return color(*ui.TECHTREE_NODE_UNLOCKED)
         elif state == tt.STATE_RESEARCHING:
             return color(*ui.TECHTREE_NODE_RESEARCHING)
         elif state == tt.STATE_AVAILABLE:
             return color(*ui.TECHTREE_NODE_AVAILABLE)
-        elif state == tt.STATE_LOCKED:
-            return color(*ui.TECHTREE_NODE_LOCKED)
-        elif state == tt.ACH_UNLOCKED:
-            return color(*ui.TECHTREE_ACH_UNLOCKED)
-        elif state == tt.ACH_PARTIAL:
-            return color(*ui.TECHTREE_ACH_PARTIAL)
         else:
-            return color(*ui.TECHTREE_ACH_LOCKED)
+            return color(*ui.TECHTREE_NODE_LOCKED)
 
     def _node_border_color(self, state, node_id):
         """节点边框色。"""

@@ -1,5 +1,5 @@
 {
-  "comment": "塔类型数据。运行时由 gamedata.py 读取并构建 entities.TOWER_TYPES。\n字段: name_cn 显示名 / base_damage base_range base_cooldown base_cost 基础属性 /\nrequires_tech 科技前置(数组) / slow_* 减速 / splash_* 溅射 / bonus_* 针对敌人增伤 /\nmaterials 拆除回收材料(经典塔) / color [r,g,b]。",
+  "comment": "塔类型数据。运行时由 gamedata.py 读取并构建 entities.TOWER_TYPES。\n字段: name_cn 显示名 / base_damage base_range base_cooldown base_cost 基础属性 /\nbase_hp 塔体生命值(敌人近战拆塔的目标) / requires_tech 科技前置(数组) / slow_* 减速 / splash_* 溅射 /\nbonus_* 针对敌人增伤 / materials 拆除回收材料(经典塔) / color [r,g,b]。\n防御塔(城墙类): no_attack=true 表示塔自身永不索敌开火(仅在被拆时挨打)；\n武器攻击来自挂载(weapon_slots 槽位数)，把已合成的武器放上去才获得攻击力。\nbase_damage/base_range 对 no_attack 塔恒为 0，允许为 0。",
   "towers": {
     "stone_thrower": {
       "name_cn": "投石塔",
@@ -7,6 +7,7 @@
       "base_range": 5.0,
       "base_cooldown": 1.0,
       "base_cost": 50,
+      "base_hp": 60,
       "requires_tech": [],
       "materials": {"cobble": 3},
       "color": [150, 150, 150]
@@ -17,6 +18,7 @@
       "base_range": 4.0,
       "base_cooldown": 0.8,
       "base_cost": 80,
+      "base_hp": 55,
       "requires_tech": [],
       "splash_radius": 2.2,
       "splash_falloff": 0.5,
@@ -29,6 +31,7 @@
       "base_range": 3.0,
       "base_cooldown": 0.5,
       "base_cost": 40,
+      "base_hp": 40,
       "requires_tech": [],
       "slow_factor": 0.45,
       "slow_duration": 2.0,
@@ -41,11 +44,51 @@
       "base_range": 7.0,
       "base_cooldown": 1.2,
       "base_cost": 200,
+      "base_hp": 120,
       "requires_tech": [],
       "bonus_vs": "tank",
       "bonus_mult": 2.0,
       "materials": {"iron_ingot": 2},
       "color": [180, 180, 190]
+    },
+    "palisade_wall": {
+      "name_cn": "防御围墙",
+      "base_damage": 0,
+      "base_range": 0,
+      "base_cooldown": 1.0,
+      "base_cost": 60,
+      "base_hp": 400,
+      "no_attack": true,
+      "weapon_slots": 1,
+      "requires_tech": ["stone:A12"],
+      "materials": {"plank": 2, "cobble": 1},
+      "color": [160, 125, 80]
+    },
+    "city_wall": {
+      "name_cn": "防御城墙",
+      "base_damage": 0,
+      "base_range": 0,
+      "base_cooldown": 1.0,
+      "base_cost": 150,
+      "base_hp": 900,
+      "no_attack": true,
+      "weapon_slots": 2,
+      "requires_tech": ["bronze:O8"],
+      "materials": {"cobble": 3, "stone": 2},
+      "color": [115, 115, 120]
+    },
+    "star_fort": {
+      "name_cn": "星形要塞",
+      "base_damage": 0,
+      "base_range": 0,
+      "base_cooldown": 1.0,
+      "base_cost": 320,
+      "base_hp": 1600,
+      "no_attack": true,
+      "weapon_slots": 3,
+      "requires_tech": ["iron:iX17"],
+      "materials": {"cobble": 3, "stone": 3, "iron_ingot": 1},
+      "color": [125, 135, 150]
     }
   }
 }

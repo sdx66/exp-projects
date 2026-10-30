@@ -1,5 +1,5 @@
 {
-  "comment": "刷怪点与侦察兵数据。distribution: 粗格网格/密度/材料化半径/路径步数上限/开局清醒数。\nkinds: 刷怪点种类，按覆盖生物群系选择（spawner_kind_for(biome)，无匹配回落 standard）。\n每类: trigger_radii 三触发半径(presence 敌人路过/build 造塔/combat 战斗);\nscout 侦察兵属性(种类/感知半径/批次/游荡时长与速度/转向/噪音导向/避水探测/遭遇信息半径)。",
+  "comment": "刷怪点与侦察兵数据。distribution: 粗格网格/密度/材料化半径/路径步数上限/开局清醒数。\nkinds: 刷怪点种类，按覆盖生物群系选择（spawner_kind_for(biome)，无匹配回落 standard）。\n每类: trigger_radii 四触发半径(presence 敌人路过/build 造塔/combat 战斗/edit 挖放方块);\nscout 侦察兵属性(种类/感知半径/批次/游荡时长与速度/转向/噪音导向/避水探测/遭遇信息半径/方块活动感知半径)。",
   "distribution": {
     "grid": 18,
     "density": 0.06,
@@ -11,7 +11,7 @@
   "kinds": {
     "standard": {
       "biomes": ["plains", "desert", "savanna"],
-      "trigger_radii": {"presence": 22.0, "build": 37.0, "combat": 52.0},
+      "trigger_radii": {"presence": 22.0, "build": 37.0, "combat": 52.0, "edit": 30.0},
       "scout": {
         "enemy_type": "regular",
         "perception_radius": 15.0,
@@ -23,12 +23,13 @@
         "noise_bias": 0.7,
         "noise_jitter": 0.5,
         "probe_dist": 4,
-        "meet_radius": 8.0
+        "meet_radius": 8.0,
+        "edit_radius": 12.0
       }
     },
     "highland": {
       "biomes": ["mountain", "tundra"],
-      "trigger_radii": {"presence": 30.0, "build": 45.0, "combat": 60.0},
+      "trigger_radii": {"presence": 30.0, "build": 45.0, "combat": 60.0, "edit": 35.0},
       "scout": {
         "enemy_type": "fast",
         "perception_radius": 18.0,
@@ -40,12 +41,13 @@
         "noise_bias": 0.8,
         "noise_jitter": 0.4,
         "probe_dist": 5,
-        "meet_radius": 8.0
+        "meet_radius": 8.0,
+        "edit_radius": 14.0
       }
     },
     "forest_sentinel": {
       "biomes": ["forest"],
-      "trigger_radii": {"presence": 18.0, "build": 30.0, "combat": 45.0},
+      "trigger_radii": {"presence": 18.0, "build": 30.0, "combat": 45.0, "edit": 25.0},
       "scout": {
         "enemy_type": "regular",
         "perception_radius": 14.0,
@@ -57,7 +59,8 @@
         "noise_bias": 0.6,
         "noise_jitter": 0.6,
         "probe_dist": 4,
-        "meet_radius": 8.0
+        "meet_radius": 8.0,
+        "edit_radius": 10.0
       }
     }
   }

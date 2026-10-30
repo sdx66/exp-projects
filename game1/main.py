@@ -120,7 +120,9 @@ class SeedScreen:
             # 含 w/s/l 的文字种子就打不出来。
             if 32 <= key <= 126:
                 if len(self.input_text) < MAX_SEED_LEN:
-                    self.input_text += chr(key).lower()
+                    # 保留原字符大小写：get_seed 按原文本 crc32，
+                    # 强制小写会改变混合大小写种子的世界，且无法复现。
+                    self.input_text += chr(key)
                 continue
             if key == rl.KEY_ENTER or key == rl.KEY_KP_ENTER:
                 self._activate_menu(self.menu_index)
@@ -478,12 +480,26 @@ def _run_game_loop(game):
             pending = getattr(game, "_pending_replace", None)
             if pending:
                 game.renderer.unload()
+                # 旧 Game 的小地图持有 GPU 纹理，必须显式释放（否则泄漏）
+                mm = getattr(game, "minimap", None)
+                if mm is not None:
+                    unload_fn = getattr(mm, "unload", None)
+                    if callable(unload_fn):
+                        unload_fn()
                 game = pending
     finally:
         try:
             game.renderer.unload()
         except Exception as e:
             print(f"[退出] 渲染器卸载失败: {type(e).__name__}: {e}")
+        try:
+            mm = getattr(game, "minimap", None)
+            if mm is not None:
+                unload_fn = getattr(mm, "unload", None)
+                if callable(unload_fn):
+                    unload_fn()
+        except Exception as e:
+            print(f"[退出] 小地图卸载失败: {type(e).__name__}: {e}")
         rl.CloseWindow()
         print("\n[退出] 游戏已关闭。")
 
@@ -545,7 +561,7 @@ def main():
             game = _create_new_game(seed)
 
     print("\n[提示] 游戏运行中。按 Esc 取消操作/关闭面板；关闭窗口请点右上角 X。")
-    print("[提示] V: 2D/3D | T: 科技面板(再按T关闭) | B: 加工 | X: 拆除")
+    print("[提示] V: 2D/3D | T: 科技面板(再按T关闭) | B: 加工 | X: 拆除 | R: 挖掘 | F: 放置方块")
     print("[提示] C: 武器库 | P: 刷怪点波次面板 | F5: 快速存档 | F8: 存档管理")
 
     _run_game_loop(game)
