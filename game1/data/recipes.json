@@ -1,5 +1,5 @@
 {
-  "comment": "配方与物品数据。运行时由 gamedata.py 读取。\nmaterials: 材料定义 class=raw|processed + color + name_cn。\nprocessing: 加工配方 key=规则名; hand/tool=徒手/工具产量(hand=0 徒手不可),\ntime_hand/time_tool 耗时, requires_tool 必需工具, requires_tech 科技前置。\ntools: 工具合成配方; weapons: 武器合成配方(可装备为塔); 均支持 requires_tech。\ndismantle_refund: 拆塔回收比例。",
+  "comment": "配方与物品数据。运行时由 gamedata.py 读取。\nmaterials: 材料定义 class=raw|processed + color + name_cn。\nprocessing: 加工配方 key=规则名; hand/tool=徒手/工具产量(hand=0 徒手不可),\ntime_hand/time_tool 耗时, requires_tool 必需工具, requires_tech 科技前置。\ntools: 工具合成配方; weapons: 武器合成配方(可装备为塔); 均支持 requires_tech。\n工具可带 mining 段(石镐/铁镐/蒸汽凿岩机): tier 采掘档位、speed 速度系数——开采塔需挂载\nmining 工具才能开采，档位决定可挖矿块(见 blocks.BlockDef.mining_tier)。\ndismantle_refund: 拆塔回收比例。",
   "dismantle_refund": 0.5,
   "materials": {
     "dirt": {"class": "raw", "color": [121, 85, 72], "name_cn": "泥土"},
@@ -11,6 +11,8 @@
     "hide": {"class": "raw", "color": [150, 110, 70], "name_cn": "兽皮"},
     "fat": {"class": "raw", "color": [230, 220, 160], "name_cn": "油脂"},
     "bone": {"class": "raw", "color": [230, 225, 210], "name_cn": "兽骨"},
+    "coal": {"class": "raw", "color": [70, 70, 75], "name_cn": "煤"},
+    "uranium_ore": {"class": "raw", "color": [110, 200, 130], "name_cn": "铀矿石"},
     "plank": {"class": "processed", "color": [180, 130, 70], "name_cn": "木板"},
     "cobble": {"class": "processed", "color": [120, 120, 120], "name_cn": "圆石"},
     "iron_ingot": {"class": "processed", "color": [200, 200, 210], "name_cn": "铁锭"},
@@ -19,7 +21,8 @@
     "rope": {"class": "processed", "color": [160, 130, 80], "name_cn": "绳索"},
     "glue": {"class": "processed", "color": [180, 140, 60], "name_cn": "胶黏剂"},
     "bone_ware": {"class": "processed", "color": [235, 230, 215], "name_cn": "骨器"},
-    "bloom": {"class": "processed", "color": [160, 152, 146], "name_cn": "铁块"}
+    "bloom": {"class": "processed", "color": [160, 152, 146], "name_cn": "铁块"},
+    "nuclear_fuel": {"class": "processed", "color": [90, 220, 120], "name_cn": "核燃料"}
   },
   "processing": {
     "wood->plank": {
@@ -91,6 +94,13 @@
       "time_hand": null, "time_tool": 0.8,
       "requires_tool": "grindstone",
       "requires_tech": []
+    },
+    "uranium_ore->nuclear_fuel": {
+      "in": "uranium_ore", "out": "nuclear_fuel",
+      "hand": 1, "tool": 2,
+      "time_hand": 8.0, "time_tool": 4.0,
+      "requires_tool": null,
+      "requires_tech": ["electric:eX2"]
     }
   },
   "tools": {
@@ -163,6 +173,37 @@
       "applies": "copper->bronze",
       "color": [140, 120, 90],
       "requires_tech": ["bronze:Z2"]
+    },
+    "nuclear_refiner": {
+      "label_cn": "核燃料精炼装置",
+      "recipe": {"iron_ingot": 2, "copper": 2},
+      "applies": "uranium_ore->nuclear_fuel",
+      "color": [110, 200, 140],
+      "requires_tech": ["electric:eX2"]
+    },
+    "stone_pick": {
+      "label_cn": "石镐",
+      "recipe": {"cobble": 2, "plank": 1},
+      "applies": null,
+      "mining": {"tier": 1, "speed": 1.0},
+      "color": [150, 150, 150],
+      "requires_tech": ["stone:C5"]
+    },
+    "iron_pick": {
+      "label_cn": "铁镐",
+      "recipe": {"iron_ingot": 2, "plank": 1},
+      "applies": null,
+      "mining": {"tier": 2, "speed": 2.0},
+      "color": [200, 200, 210],
+      "requires_tech": ["iron:iQ1"]
+    },
+    "steam_drill": {
+      "label_cn": "蒸汽凿岩机",
+      "recipe": {"iron_ingot": 4, "bronze": 2, "plank": 2},
+      "applies": null,
+      "mining": {"tier": 3, "speed": 4.0},
+      "color": [180, 140, 80],
+      "requires_tech": ["steam:sE11"]
     }
   },
   "weapons": {
@@ -290,7 +331,7 @@
       "damage": 16, "range": 8.0, "cooldown": 1.0,
       "install_fee": 40,
       "color": [170, 130, 70],
-      "requires_tech": []
+      "requires_tech": ["stone:B27", "stone:B17"]
     },
     "longbow": {
       "label_cn": "长弓",

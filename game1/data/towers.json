@@ -1,5 +1,5 @@
 {
-  "comment": "塔类型数据。运行时由 gamedata.py 读取并构建 entities.TOWER_TYPES。\n字段: name_cn 显示名 / base_damage base_range base_cooldown base_cost 基础属性 /\nbase_hp 塔体生命值(敌人近战拆塔的目标) / requires_tech 科技前置(数组) / slow_* 减速 / splash_* 溅射 /\nbonus_* 针对敌人增伤 / materials 拆除回收材料(经典塔) / color [r,g,b]。\n防御塔(城墙类): no_attack=true 表示塔自身永不索敌开火(仅在被拆时挨打)；\n武器攻击来自挂载(weapon_slots 槽位数)，把已合成的武器放上去才获得攻击力。\nbase_damage/base_range 对 no_attack 塔恒为 0，允许为 0。",
+  "comment": "塔类型数据。运行时由 gamedata.py 读取并构建 entities.TOWER_TYPES。\n字段: name_cn 显示名 / base_damage base_range base_cooldown base_cost 基础属性 /\nbase_hp 塔体生命值(敌人近战拆塔的目标) / requires_tech 科技前置(数组) / slow_* 减速 / splash_* 溅射 /\nbonus_* 针对敌人增伤 / materials 拆除回收材料(经典塔) / color [r,g,b]。\n防御塔(城墙类): no_attack=true 表示塔自身永不索敌开火(仅在被拆时挨打)；\n武器攻击来自挂载(weapon_slots 槽位数)，把已合成的武器放上去才获得攻击力。\nbase_damage/base_range 对 no_attack 塔恒为 0，允许为 0。\n仓储塔: storage_capacity 固定容量(空间单位)，可存材料/武器/工具；\n每件物品占用空间见 items.item_volume(原料1/加工品2/武器·工具6)，存取经仓储窗口。\n加工塔: processing_capacity 固定容量(空间单位，同 item_volume 计)，比仓储塔小；\n工具放入塔内即装配，启用其 requires_tool 配方自动加工；无工具配方在窗口手动点选，\n产物与原料同池存放，存取与加工经加工窗口。\n研究塔: research_attr 基础学识属性(等级制，每级 +config.RESEARCH_ATTR_PER_LEVEL)；\nstorage_capacity 供其存放研究所需工具/材料；station=true 的科技需一座满足条件\n(学识≥attr_req、工具/材料在塔内)的研究塔才能开始研究，研究塔自身无科技前置。\n开采塔: mining 段配置竖井开采——footprint_min/max 占地长宽范围(≥3)、ring 外围圈数\n(默认1，内部 (m-2)*(n-2) 列向下开采)、mine_range 开采深度上限、mine_speed_mult 速度系数、\nbase_mine_time 每块基础耗时(秒)；storage_capacity 为缓冲仓储，belt_export 白名单控制\n导出传送带(手动取回走仓储窗口)；requires_tech 门控科技(steam:sE11)。",
   "towers": {
     "stone_thrower": {
       "name_cn": "投石塔",
@@ -45,7 +45,7 @@
       "base_cooldown": 1.2,
       "base_cost": 200,
       "base_hp": 120,
-      "requires_tech": [],
+      "requires_tech": ["iron:U2"],
       "bonus_vs": "tank",
       "bonus_mult": 2.0,
       "materials": {"iron_ingot": 2},
@@ -89,6 +89,71 @@
       "requires_tech": ["iron:iX17"],
       "materials": {"cobble": 3, "stone": 3, "iron_ingot": 1},
       "color": [125, 135, 150]
+    },
+    "storage_tower": {
+      "name_cn": "仓储塔",
+      "base_damage": 0,
+      "base_range": 0,
+      "base_cooldown": 1.0,
+      "base_cost": 120,
+      "base_hp": 80,
+      "no_attack": true,
+      "weapon_slots": 1,
+      "storage_capacity": 60,
+      "requires_tech": ["stone:A14"],
+      "materials": {"plank": 3, "cobble": 1},
+      "color": [190, 150, 95]
+    },
+    "processing_tower": {
+      "name_cn": "加工塔",
+      "base_damage": 0,
+      "base_range": 0,
+      "base_cooldown": 1.0,
+      "base_cost": 150,
+      "base_hp": 70,
+      "no_attack": true,
+      "weapon_slots": 1,
+      "processing_capacity": 24,
+      "requires_tech": ["stone:B30"],
+      "materials": {"plank": 2, "cobble": 2},
+      "color": [205, 130, 70]
+    },
+    "research_tower": {
+      "name_cn": "研究塔",
+      "base_damage": 0,
+      "base_range": 0,
+      "base_cooldown": 1.0,
+      "base_cost": 100,
+      "base_hp": 150,
+      "no_attack": true,
+      "weapon_slots": 1,
+      "storage_capacity": 40,
+      "research_attr": 1,
+      "requires_tech": [],
+      "materials": {"plank": 2, "cobble": 1},
+      "color": [130, 110, 190]
+    },
+    "mining_tower": {
+      "name_cn": "开采塔",
+      "base_damage": 0,
+      "base_range": 0,
+      "base_cooldown": 1.0,
+      "base_cost": 200,
+      "base_hp": 90,
+      "no_attack": true,
+      "weapon_slots": 2,
+      "storage_capacity": 40,
+      "requires_tech": ["steam:sE11"],
+      "materials": {"cobble": 6, "stone": 4, "iron_ingot": 2},
+      "color": [110, 150, 90],
+      "mining": {
+        "footprint_min": 3,
+        "footprint_max": 7,
+        "ring": 1,
+        "mine_range": 24,
+        "mine_speed_mult": 1.0,
+        "base_mine_time": 2.0
+      }
     }
   }
 }

@@ -38,9 +38,11 @@ class ToolDef:
     name: str
     label_cn: str
     recipe: dict          # 合成配方 {material: amount}
-    applies: str          # 适用的加工配方键
+    applies: str          # 适用的加工配方键（采掘工具为空/None）
     color: tuple
     requires_tech: tuple = ()
+    mining_tier: int = 0      # 采掘档位（0 = 非采掘工具；1 石镐 2 铁镐 3 蒸汽凿岩机）
+    mining_speed: float = 0.0  # 采掘速度系数（>0 即采掘工具）
 
 
 TOOL_TYPES: dict = {
@@ -48,9 +50,11 @@ TOOL_TYPES: dict = {
         name,
         d["label_cn"],
         dict(d["recipe"]),
-        d["applies"],
+        d.get("applies"),
         tuple(d["color"]),
         tuple(d.get("requires_tech", [])),
+        mining_tier=int((d.get("mining") or {}).get("tier", 0) or 0),
+        mining_speed=float((d.get("mining") or {}).get("speed", 0.0) or 0.0),
     )
     for name, d in gamedata.TOOLS_RAW.items()
 }
@@ -96,6 +100,21 @@ WEAPON_TYPES: dict = {
 CLASSIC_TOWER_MATERIALS = gamedata.CLASSIC_TOWER_MATERIALS
 
 DISMANTLE_REFUND = gamedata.DISMANTLE_REFUND  # 拆除回收比例
+
+
+# ─── 仓储体积（仓储塔按空间容量存放物品） ───────────────────
+# 每件物品占用的空间单位：原料最省，加工品更大，武器/工具最占地方
+
+WEAPON_TOOL_VOLUME = 6
+
+def item_volume(name: str) -> int:
+    """单件物品占用的仓储空间(空间单位)。
+    原料 1 / 加工品 2 / 武器·工具 6；未知物品按原料计。"""
+    if name in WEAPON_TYPES or name in TOOL_TYPES:
+        return WEAPON_TOOL_VOLUME
+    if name in PROCESSED:
+        return 2
+    return 1
 
 
 # ─── 背包 ──────────────────────────────────────────────────

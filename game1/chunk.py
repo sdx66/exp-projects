@@ -16,6 +16,9 @@ from biomes import BIOMES
 
 # 生物群系 → 表面方块 ID 映射（预计算，避免热路径字典查找）
 BIOME_SURFACE_BLOCK = {name: b.surface_block for name, b in BIOMES.items()}
+# 生物群系 → 近表层地下方块 ID 映射（BUG-120：消费 biomes.underground_block）
+BIOME_UNDERGROUND_BLOCK = {name: b.underground_block
+                           for name, b in BIOMES.items()}
 
 
 # ─── 自然高度（大本营平整前的地形高度） ──────────────────────
@@ -272,7 +275,9 @@ class Chunk:
 
         # ─── 6. 生物群系判定（向量化 if-else 链）─────────
         biome_arr = np.full((size, size), "plains", dtype=object)
-        biome_arr[h < 0.004] = "ocean"
+        # 与 _ocean_cols 阈值一致（h<0.005），否则 [0.004,0.005) 沿岸格渲染成
+        # 海水但 get_biome() 返回 plains，渲染与群系判定不一致。
+        biome_arr[h < 0.005] = "ocean"
         snow_mask = (temp < -10.0) & (h >= 0.18)
         biome_arr[snow_mask] = "snowy"
         tundra_mask = (temp < 3.0) & (temp >= -10.0) & (h >= 0.18)
@@ -283,12 +288,29 @@ class Chunk:
         biome_arr[desert_mask] = "desert"
         savanna_mask = (temp > 20.0) & (moisture >= 0.3) & (h >= 0.18)
         biome_arr[savanna_mask] = "savanna"
-        forest_mask = (temp < 15.0) & (moisture > 0.5) & (h >= 0.18)
+        # 森林只覆盖温带低地（BUG-125）：原仅 temp<15，是 snowy/tundra 的超集，
+        # 会把高湿度的雪原/苔原/山地覆盖成 forest（表面变草）。加 temp>=3 下界
+        # + 海拔上界；与 ui_minimap.compute_surface_blocks /
+        # world._biome_and_block_pure 三处必须逐字一致。
+        forest_mask = ((temp < 15.0) & (temp >= 3.0) & (moisture > 0.5)
+                       & (h >= 0.18)
+                       & (altitude <= config.MOUNTAIN_ALT_RATIO * height))
         biome_arr[forest_mask] = "forest"
 
         # ─── 7. 表面高度 & 表面方块 ──────────────────────
         surface_y_arr = np.floor(altitude).astype(np.int32)  # [size, size]
+        # 饱和列（h_raw^0.7 ≥1 → altitude==height）会得到 surface_y==height，
+        # 越界（有效格 [0,height)）：表面方块永不写入（col_pos==0 需 y==height，
+        # 落在 blocks[:,:,:max_y] 之外）、surface_height 越界、峰顶不可采/建。
+        # 夹到最高有效格 height-1，保证表面方块落地、列顶在界内（BUG-019）；
+        # ui_minimap.compute_surface_blocks 同样夹到 height-1（BUG-116），
+        # 饱和列由此取群系表面方块，minimap 与 3D 一致。
+        surface_y_arr = np.minimum(surface_y_arr, height - 1)
         max_y = min(height, int(surface_y_arr.max()) + 7)
+        # 恒定海平面（BUG-007）需要 y 轴覆盖到 sea_top，否则沿岸区块（海底浅）
+        # 的 max_y 装不下水面格
+        if self._ocean_cols is not None and self._ocean_cols.any():
+            max_y = max(max_y, min(height, int(0.005 * height) + 2))
         max_y = max(1, max_y)
         self.max_y = max_y
 
@@ -296,6 +318,11 @@ class Chunk:
         surface_blocks = np.zeros((size, size), dtype=np.uint8)
         for biome_name, block_id in BIOME_SURFACE_BLOCK.items():
             surface_blocks[biome_arr == biome_name] = block_id
+
+        # 近表层地下方块：按生物群系映射（BUG-120，消费 biomes.underground_block）
+        underground_blocks = np.zeros((size, size), dtype=np.uint8)
+        for biome_name, block_id in BIOME_UNDERGROUND_BLOCK.items():
+            underground_blocks[biome_arr == biome_name] = block_id
 
         # 高海拔寒冷 → 雪覆盖
         snow_cover = (surface_y_arr > config.SNOW_SURFACE_RATIO * height) & (temp < 2.0)
@@ -319,7 +346,17 @@ class Chunk:
             non_ocean = ~is_ocean
             b[(col_pos < 0) & is_ocean] = BLOCK_ID['stone']
             b[(col_pos >= 0) & (col_pos <= 1) & is_ocean] = BLOCK_ID['sand']
-            b[(col_pos >= 2) & (col_pos <= 6) & is_ocean] = BLOCK_ID['water']
+            # 海面锚定恒定海平面而非海底：原实现水位 = 海底+6，随海底抬升，
+            # 造成沿岸水墙高于滩面、深海水位低于近岸（BUG-007）。
+            # 海平面取海/陆阈值 h=0.005 对应的高度 floor(0.005*height)，
+            # 水顶面与相邻滩面（h≥0.005 → surface_y≥10）齐平，不再淹岸。
+            sea_top = int(0.005 * height)
+            # 浅洋柱（surface_y ∈ {sea_top-1, sea_top}）原 water 掩码
+            # [surface_y+2, sea_top] 为空 → 干沙无水、看着像陆地（BUG-118）。
+            # 保底：每根海洋柱在 y==sea_top 处恒为水（col_pos 0..1 的海床沙
+            # 仍在水面之下）；深洋柱仍由 col_pos>=2 掩码覆盖，并集后不变。
+            water = ((col_pos >= 2) & (yy <= sea_top) | (yy == sea_top)) & is_ocean
+            b[water] = BLOCK_ID['water']
             deep = (col_pos < -3) & non_ocean
             dirt = (col_pos >= -3) & (col_pos < 0) & non_ocean
             surf = (col_pos == 0) & non_ocean
@@ -329,7 +366,10 @@ class Chunk:
             dirt = (col_pos >= -3) & (col_pos < 0)
             surf = col_pos == 0
         b[deep] = BLOCK_ID['stone']
-        b[dirt] = BLOCK_ID['dirt']
+        # 近表层泥土带按群系 underground_block（BUG-120）：沙漠→沙、雪原→冰、
+        # 山脉→石、其余→泥土；深层（col_pos<-3）恒为石头；海洋柱走上面的
+        # 显式路径（石头/沙/水），不用 underground_block。
+        np.copyto(b, underground_blocks[:, :, None], where=dirt)
         np.copyto(b, surface_blocks[:, :, None], where=surf)
         b[:, :, 0] = BLOCK_ID['bedrock']
 
@@ -377,8 +417,10 @@ class Chunk:
         unmodified = b == BLOCK_ID["stone"]
         coal = deep & (ore_noise > 0.85) & (yy > 4) & unmodified
         iron = deep & (ore_noise > 0.90) & (yy > 6) & unmodified
+        uranium = deep & (ore_noise > 0.97) & (yy > 12) & unmodified
         b[coal] = BLOCK_ID["coal_ore"]
         b[iron] = BLOCK_ID["iron_ore"]
+        b[uranium] = BLOCK_ID["uranium_ore"]
         self._ore_ready = True
 
     def _is_deep_ore_cell(self, lx, y, lz):
@@ -390,13 +432,14 @@ class Chunk:
         return not self._ocean_cols[lx, lz]
 
     # 注：标量版 _determine_biome/_determine_block 已删除——它们从未被调用，
-    # 且阈值（ocean h<0.18/0.20，水 y<=surface+5）与现行向量路径
-    # （_generate 中 h<0.004/0.005，col_pos<=6）不一致，一旦误用会几乎全判为海洋。
+    # 且其阈值（ocean h<0.18/0.20，水 y<=surface+5）与现行向量路径
+    # （_generate 海洋阈值 h<0.005、水掩码走 _ocean_cols + 恒定海平面
+    # sea_top 逻辑）不一致，一旦误用会几乎全判为海洋。
 
     # ─── 查询接口 ──────────────────────────────────────────
 
     def get_block(self, lx: int, y: int, lz: int) -> int:
-        """获取本地坐标的方块（平坦数组访问�?"""
+        """获取本地坐标的方块（平坦数组访问）"""
         if 0 <= lx < self.size and 0 <= lz < self.size and 0 <= y < self.height:
             if self._is_deep_ore_cell(lx, y, lz):
                 self._ensure_ore()

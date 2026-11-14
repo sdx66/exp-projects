@@ -1,0 +1,116 @@
+{
+  "comment": "电力系统数据（发电站 / 电池 / 燃料 / 用电端接口）。运行时由 gamedata.py 读取并构建 power 相关类型。\nstations: 发电站塔类型。字段: name_cn / output_class 输出电压等级(LV|MV|HV) / rated_kw 额定功率(千瓦) /\n  voltage_v 输出电压(伏,应与等级标称一致) / base_cost 建造费用 / base_hp 塔体生命值 /\n  requires_tech 科技前置(数组) / materials 拆除回收材料 / color [r,g,b] /\n  fuel_types 可选燃料材料列表(无燃料则恒出力,如水/风/光) / efficiency 燃料发电效率(0-1) /\n  condition 可选建设条件(water_adjacent|wind|solar;wind/solar 为环境系数,非硬性建设门槛)。\nbatteries: 电池塔类型(可串并联成组)。字段: name_cn / cell_voltage_v 单体电压(伏) /\n  cell_energy_j 单体容量(焦) / cell_max_current_a 单体最大电流(安) / voltage_class 组电压等级 /\n  base_cost / base_hp / requires_tech / materials / color。\nfuels: 燃料热值(焦/件)。电站燃烧消耗 = 产出功率 * dt / (效率 * 热值)。\nconsumer: 用电端接口参数(本轮无实际挂接对象,仅定义常量供后续接入)。\n  draw_w 单机额定功率(瓦) / speed_mult 供电提速倍率(预留)。",
+  "stations": {
+    "thermal_power": {
+      "name_cn": "火电站",
+      "output_class": "LV",
+      "rated_kw": 15,
+      "voltage_v": 220,
+      "base_cost": 400,
+      "base_hp": 90,
+      "requires_tech": ["electric:eW4"],
+      "materials": {"cobble": 4, "iron_ingot": 2},
+      "color": [150, 110, 80],
+      "fuel_types": ["wood", "plank", "coal"],
+      "efficiency": 0.35
+    },
+    "hydro_power": {
+      "name_cn": "水电站",
+      "output_class": "LV",
+      "rated_kw": 12,
+      "voltage_v": 220,
+      "base_cost": 500,
+      "base_hp": 110,
+      "requires_tech": ["electric:eW3"],
+      "materials": {"cobble": 5, "stone": 2},
+      "color": [70, 130, 220],
+      "condition": "water_adjacent"
+    },
+    "wind_power": {
+      "name_cn": "风电站",
+      "output_class": "LV",
+      "rated_kw": 4,
+      "voltage_v": 220,
+      "base_cost": 350,
+      "base_hp": 60,
+      "requires_tech": ["electric:eW13"],
+      "materials": {"plank": 3, "cobble": 1},
+      "color": [170, 190, 210],
+      "condition": "wind"
+    },
+    "solar_power": {
+      "name_cn": "光伏电站",
+      "output_class": "LV",
+      "rated_kw": 2.5,
+      "voltage_v": 220,
+      "base_cost": 300,
+      "base_hp": 50,
+      "requires_tech": ["electric:eW14"],
+      "materials": {"iron_ingot": 1, "cobble": 2},
+      "color": [230, 210, 90],
+      "condition": "solar"
+    },
+    "central_power": {
+      "name_cn": "中央电站",
+      "output_class": "MV",
+      "rated_kw": 300,
+      "voltage_v": 10000,
+      "base_cost": 2500,
+      "base_hp": 200,
+      "requires_tech": ["electric:eW6"],
+      "materials": {"cobble": 6, "iron_ingot": 4, "plank": 2},
+      "color": [120, 120, 140],
+      "fuel_types": ["coal"],
+      "efficiency": 0.42
+    },
+    "nuclear_power": {
+      "name_cn": "核电站",
+      "output_class": "HV",
+      "rated_kw": 2000,
+      "voltage_v": 110000,
+      "base_cost": 8000,
+      "base_hp": 400,
+      "requires_tech": ["electric:eX2", "electric:eW7"],
+      "materials": {"cobble": 8, "iron_ingot": 6},
+      "color": [120, 200, 140],
+      "fuel_types": ["nuclear_fuel"],
+      "efficiency": 0.33
+    }
+  },
+  "batteries": {
+    "lead_acid": {
+      "name_cn": "铅酸电池",
+      "cell_voltage_v": 2.0,
+      "cell_energy_j": 1000000,
+      "cell_max_current_a": 100,
+      "voltage_class": "LV",
+      "base_cost": 250,
+      "base_hp": 70,
+      "requires_tech": ["electric:eH3"],
+      "materials": {"copper": 1, "hide": 1},
+      "color": [90, 160, 110]
+    },
+    "lithium": {
+      "name_cn": "锂电池",
+      "cell_voltage_v": 3.7,
+      "cell_energy_j": 3500000,
+      "cell_max_current_a": 150,
+      "voltage_class": "LV",
+      "base_cost": 550,
+      "base_hp": 80,
+      "requires_tech": ["electric:eH3", "electric:eR5"],
+      "materials": {"copper": 2, "iron_ingot": 1},
+      "color": [120, 180, 230]
+    }
+  },
+  "fuels": {
+    "wood": 5000000,
+    "plank": 8000000,
+    "coal": 12000000,
+    "nuclear_fuel": 3000000000
+  },
+  "consumer": {
+    "draw_w": 1500,
+    "speed_mult": 2.0
+  }
+}

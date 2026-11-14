@@ -3,7 +3,8 @@ save_system.py - 纯 Python 存档系统（零外部依赖，仅 json/os/time/ra
 
 格式: JSON，自包含路径数据（不依赖 Universe 重生成顺序）。
 兼容: 反序列化一律 .get(key, default) —— 存档多出的字段忽略，缺少的字段兜底。
-版本: config.SAVE_VERSION，未来加 migrate(data) 做版本升级。
+版本: config.SAVE_VERSION（v10 起按塔研究：研究状态存入各研究塔 research 段，
+      旧全局 tech researching 经 migrate_v9_to_v10 迁入首座研究塔）。
 
 用法:
     import save_system
@@ -16,6 +17,7 @@ save_system.py - 纯 Python 存档系统（零外部依赖，仅 json/os/time/ra
 
 import json
 import os
+import random
 import time
 import math
 
@@ -53,15 +55,130 @@ def _serialize_tower(t) -> dict:
         "max_hp": t.max_hp,
         "source": list(t.source) if t.source else ["classic", t.type_name],
         "material_recipe": dict(t.material_recipe) if t.material_recipe else {},
-        # 防御塔挂载的武器（v6+；旧档缺省为空）
+        # 防御塔挂载的武器（v6+；旧档缺省为空）。timer 为逐帧递减的冷却倒计时
+        # （BUG-074）：不存会让读档后武器 timer 归零、立即开火白赚一次 DPS。
         "mounted_weapons": [
-            {"weapon": m["wdef"].name, "damage_mult": m["damage_mult"]}
+            {"weapon": m["wdef"].name, "damage_mult": m["damage_mult"],
+             "timer": float(m.get("timer", 0.0) or 0.0)}
             for m in getattr(t, "weapon_mounts", [])
         ],
+        # 仓储塔存物（v7+；旧档缺省为空）
+        "storage": (
+            {
+                "materials": dict(t.storage["materials"]),
+                "weapons": dict(t.storage["weapons"]),
+                "tools": sorted(t.storage["tools"]),
+            }
+            if getattr(t, "storage_capacity", 0) else None
+        ),
+        # 传送带导出白名单（v7+；旧档缺省为空集）
+        "belt_export": sorted(getattr(t, "belt_export", ()) or ()),
+        # 加工塔存物与在制任务（v6+；旧档缺省为空）
+        "processing": (
+            {
+                "materials": dict(t.processing["materials"]),
+                "weapons": dict(t.processing["weapons"]),
+                "tools": sorted(t.processing["tools"]),
+                "manual_recipe": t.manual_recipe,
+                "jobs": {k: float(v) for k, v in t.process_jobs.items()},
+                "meta": {k: dict(v) for k, v in getattr(t, "process_meta", {}).items()},
+            }
+            if getattr(t, "processing_capacity", 0) else None
+        ),
+        # 电力塔（v8+）：电站燃料桶 / 电池储能（旧档缺省为空）
+        "power_fuel": dict(getattr(t, "power_fuel", {}) or {}),
+        "charge_j": float(getattr(t, "charge_j", 0.0) or 0.0),
+        # 电站逐帧小数燃料累加器（BUG-129）：不存会让每次读档把已累计的
+        # 不足一件燃料的消耗义务清零，等于白饶一件燃料。旧档缺省 0.0（兼容）。
+        "fuel_need_acc": float(getattr(t, "_fuel_need_acc", 0.0) or 0.0),
+        # 开采塔（v9+）：足迹 / 竖井前沿与进度（旧档缺省为空）
+        "mining": (
+            {
+                "footprint": [int(t.footprint[0]), int(t.footprint[1])],
+                "start_surface": {
+                    f"{cx},{cz}": int(sy)
+                    for (cx, cz), sy in getattr(t, "mine_start_surface", {}).items()
+                },
+                "shaft": {
+                    f"{cx},{cz}": [int(col["front"]) if col["front"] is not None else -1,
+                                   float(col["timer"])]
+                    for (cx, cz), col in getattr(t, "mine_shaft", {}).items()
+                },
+            }
+            if getattr(t, "is_mining", False) else None
+        ),
+        # 研究塔（v10+）：current/timer/total + 排队列表（旧档缺省为空）
+        "research": (
+            {
+                "current": getattr(t, "research_current", None),
+                "timer": float(getattr(t, "research_timer", 0.0) or 0.0),
+                "total": float(getattr(t, "research_total", 0.0) or 0.0),
+                "queue": list(getattr(t, "research_queue", ()) or ()),
+            }
+            if getattr(t, "is_research", False) else None
+        ),
+    }
+
+def _serialize_base_research(br) -> dict:
+    """基地手研通道序列化（station=false 科技，无需研究塔；v11+）。"""
+    if br is None:
+        return None
+    return {
+        "current": getattr(br, "research_current", None),
+        "timer": float(getattr(br, "research_timer", 0.0) or 0.0),
+        "total": float(getattr(br, "research_total", 0.0) or 0.0),
+        "queue": list(getattr(br, "research_queue", ()) or ()),
     }
 
 
-def _serialize_enemy(e) -> dict:
+def _serialize_belt(b) -> dict:
+    """传送带序列化：cell / kind / direction / 带内货物 / 均分器计数 / 桥两条 lane。"""
+    d = {
+        "cell": [b.cell[0], b.cell[1]],
+        "kind": b.kind,
+        "direction": b.direction,
+        "counter": getattr(b, "counter", 0),
+    }
+    if b.kind == "bridge":
+        d["lanes"] = [
+            {"direction": lane["direction"],
+             "items": [[it["name"], float(it["head"])] for it in lane["items"]]}
+            for lane in b.lanes
+        ]
+    else:
+        d["items"] = [[it["name"], float(it["head"])] for it in b.items]
+    return d
+
+
+def _serialize_wire(w) -> dict:
+    """电线序列化：cell / kind / 跳闸计时（电流/损耗为求解结果，不持久化）。"""
+    return {
+        "cell": [w.cell[0], w.cell[1]],
+        "kind": w.kind,
+        "trip_timer": float(getattr(w, "trip_timer", 0.0) or 0.0),
+        "tripped": bool(getattr(w, "tripped", False)),
+    }
+
+
+def _serialize_enemy(e, tower_ids=None, pathfinder=None) -> dict:
+    """序列化敌人。tower_ids: {id(Tower): 索引}，用于把攻击目标还原成引用
+    （BUG-070：behavior='attack_tower' 但 attack_target 不存，读档后弃攻回 wave）。
+    pathfinder: 用于判定敌人是否真走在变体路径上（BUG-076）。"""
+    at = getattr(e, "attack_target", None)
+    if at is not None and tower_ids:
+        attack_target = tower_ids.get(id(at))
+    else:
+        attack_target = None
+    # 是否真用变体路径（BUG-076）：存档格式里 path_variant=0 既可能是变体 0，
+    # 也可能是出生时寻路失败退回主线的敌人。按对象同一性比对当前变体集，
+    # 只在确实命中变体时置 True，读档才挂变体，否则保持主线。
+    on_variant = False
+    sid = getattr(e, "home_spawner_id", -1)
+    if pathfinder is not None and isinstance(sid, int) and sid >= 0:
+        entry = pathfinder.variants.get((sid, e.type_name))
+        if entry:
+            cur = getattr(e, "path", None)
+            on_variant = any(cur is vp for vp in (entry.get("paths") or []))
     return {
         "type_name": e.type_name,
         "position": list(e.position),
@@ -71,6 +188,9 @@ def _serialize_enemy(e) -> dict:
         "max_health": e.max_health,
         "speed": e.speed,
         "reward": e.reward,
+        # #2 掉落波次口径：记录生成时的刷怪点 wave，读档后击杀掉落加成
+        # 仍与本敌人 reward/血量/速度同口径（不由全局 self.wave 代替）。
+        "spawn_wave": getattr(e, "spawn_wave", 0),
         "active": e.active,
         "slow_timer": e.slow_timer,
         "slow_factor": e.slow_factor,
@@ -82,6 +202,8 @@ def _serialize_enemy(e) -> dict:
         "personality": dict(e.personality) if e.personality else None,
         # 行为状态机字段（v2+）
         "behavior": getattr(e, "behavior", "wave"),
+        # 攻击目标（v10+）：game.towers 中的索引，None = 无目标（旧档缺省）
+        "attack_target": attack_target,
         "home_spawner_id": getattr(e, "home_spawner_id", -1),
         "has_message": getattr(e, "has_message", False),
         "scout_returned_with_message": getattr(e, "scout_returned_with_message", False),
@@ -92,6 +214,8 @@ def _serialize_enemy(e) -> dict:
         "return_path_index": getattr(e, "return_path_index", 0),
         # 寻路状态（v5+）
         "path_variant": getattr(e, "path_variant", 0),
+        # 是否真用变体路径（v10+，BUG-076）：读档据此决定挂变体还是保持主线
+        "on_variant": on_variant,
         "path_version": getattr(e, "path_version", -1),
         "attack_timer": getattr(e, "attack_timer", 0.0),
         "dig_target": list(getattr(e, "dig_target", None) or []),
@@ -99,7 +223,17 @@ def _serialize_enemy(e) -> dict:
         "dig_y": getattr(e, "dig_y", None),
         "dig_base_y": getattr(e, "dig_base_y", None),
         "dig_passed": bool(getattr(e, "dig_passed", False)),
+        "dug_count": getattr(e, "_dug_count", 0),
+        # BUG-103：会话是否改低了目标列通行高度（读档续挖时需保留，否则
+        # 地形变化漏 bump world_version）
+        "dig_marked_passage": bool(getattr(e, "_dig_marked_passage", False)),
         "repath_timer": getattr(e, "repath_timer", 0.0),
+        # R3-H1：BUG-105"原地等待"标记必须进存档——否则读档后等待态敌人变
+        # 主动攻基地（恢复主线末段 + waiting=False → 走完末段即结算 reached_base）。
+        "waiting_for_path": bool(getattr(e, "waiting_for_path", False)),
+        # 非标准侦察兵配置（v6+）：丢失会让高地带/森林哨兵读档后退回标准侦察兵
+        "scout_cfg": (dict(getattr(e, "scout_cfg", None))
+                      if getattr(e, "scout_cfg", None) else None),
     }
 
 
@@ -190,6 +324,9 @@ def serialize_game(game) -> dict:
                     "length": pd.length,
                     "avg_slope": pd.avg_slope,
                     "dig_cells": [list(c) for c in pd.dig_cells],
+                    # 变体版本号（BUG-072）：-1 = 存档时已失效（陈旧路径）。
+                    # 不存会让读档把陈旧变体当成当前版本复活。
+                    "version": entry.get("version", -1),
                 })
 
     # 塔（用于 projectile 的 source_tower 索引）
@@ -247,14 +384,16 @@ def serialize_game(game) -> dict:
             "tools": sorted(game.inventory.tools),
         },
         "towers": [_serialize_tower(t) for t in game.towers],
-        "enemies": [_serialize_enemy(e) for e in game.enemies],
+        "belts": [_serialize_belt(b) for b in getattr(game, "belts", ())],
+        "wires": [_serialize_wire(w) for w in getattr(game, "wires", ())],
+        "enemies": [_serialize_enemy(e, tower_ids, pf) for e in game.enemies],
         "projectiles": projectiles,
         "pickups": [_serialize_pickup(p) for p in game.pickups],
         "tech": {
             "unlocked": sorted(game.unlocked_tech),
-            "researching": game.tech_researching,
-            "research_timer": game.tech_research_timer,
-            "research_total": game.tech_research_total,
+            # v10+：研究状态按塔保存（见塔 research 段），不再写全局槽
+            # v11+：基地手研通道（station=false 科技，无需研究塔）
+            "base_research": _serialize_base_research(getattr(game, "base_research", None)),
         },
         "world": {
             "rng_state": _serialize_rng(universe.rng),
@@ -328,10 +467,73 @@ def _restore_spawner_positions(universe, spawners_data):
             continue
         gx, gz = x // grid, z // grid
         if universe._spawner_id_for(gx, gz) != sid:
-            # 存档 id 与坐标不符（旧格式/损坏），跳过
+            # 存档 id 与坐标推导不符（旧格式/损坏），跳过
+            continue
+        if sid in universe.spawners:
             continue
         universe._materialized_coarse.add((gx, gz))
         universe._materialize_spawner_at_coarse(gx, gz)
+
+
+def _spawner_ids_need_reencode(data: dict) -> bool:
+    """检测存档刷怪点 id 是否仍是 BUG-098 修复前的 base-65536 编码。
+
+    新编码 (gx&0xFFFF)<<16|(gz&0xFFFF) 对可达网格与旧编码取值不同。
+    任一存档刷怪点：用其坐标重算新编码，若与存储 id 不符 → 需要重编码。
+    全部相符（已是新档）则返回 False，避免无谓重映射。
+    """
+    grid = gamedata.SPAWNER_GRID
+    for sd in data.get("spawners", []):
+        if not isinstance(sd, dict):
+            continue
+        sid = sd.get("spawner_id")
+        x, z = sd.get("x"), sd.get("z")
+        if not isinstance(sid, int) or not isinstance(x, int) or not isinstance(z, int):
+            continue
+        if sid != ((x // grid) & 0xFFFF) << 16 | ((z // grid) & 0xFFFF):
+            return True
+    return False
+
+
+def _reencode_spawner_ids(data: dict):
+    """BUG-098 存档兼容：把旧 base-65536 刷怪点 id 重映射为当前定宽编码。
+
+    刷怪点坐标随存档保存且稳定，故以坐标重算新 id，建立 old→new 映射后
+    同步更新 spawners / paths / variants / enemies 里的所有 spawner_id 引用，
+    保证读档后 id 与当前 _spawner_id_for 一致（否则 _restore_spawner_positions
+    会因 id 不符丢弃刷怪点，敌人/路径随之失联）。
+    """
+    grid = gamedata.SPAWNER_GRID
+    old_to_new = {}
+    for sd in data.get("spawners", []):
+        if not isinstance(sd, dict):
+            continue
+        x, z = sd.get("x"), sd.get("z")
+        if not isinstance(x, int) or not isinstance(z, int):
+            continue
+        old = sd.get("spawner_id")
+        new = ((x // grid) & 0xFFFF) << 16 | ((z // grid) & 0xFFFF)
+        if isinstance(old, int):
+            old_to_new[old] = new
+        sd["spawner_id"] = new
+    if not old_to_new:
+        return
+    # 路径（dict by spawner_id，序列化为 list 项）
+    for pd in data.get("paths", []):
+        if isinstance(pd, dict) and pd.get("spawner_id") in old_to_new:
+            pd["spawner_id"] = old_to_new[pd["spawner_id"]]
+    # 变体（扁平 list，每项带 spawner_id/type_name）
+    for vd in data.get("variants", []):
+        if isinstance(vd, dict) and vd.get("spawner_id") in old_to_new:
+            vd["spawner_id"] = old_to_new[vd["spawner_id"]]
+    # 敌人（home_spawner_id / path_ref）
+    for ed in data.get("enemies", []):
+        if not isinstance(ed, dict):
+            continue
+        for field in ("home_spawner_id", "path_ref"):
+            old = ed.get(field)
+            if isinstance(old, int) and old in old_to_new:
+                ed[field] = old_to_new[old]
 
 
 def _restore_rng(universe, rng_state_data):
@@ -400,8 +602,17 @@ def _restore_variants(game, variants_data):
             sid = int(vd.get("spawner_id", 0))
             type_name = str(vd.get("type_name", ""))
             idx = int(vd.get("index", 0))
-            points = tuple(tuple(pt) for pt in vd.get("points", []))
+            # 每个点必须恰好 3 元素 (x,y,z)：下面 `for x, _y, z in pd.points`
+            # 的解包在 try/except 之外，一个 2 元素的坏点会抛 ValueError 并
+            # 让整个存档被拒（BUG-115）。这里过滤掉非 3 元素的点，若有脏数据
+            # （过滤后数量与原始数量不一致）则整条变体跳过，沿用防御性 continue。
+            raw_points = list(vd.get("points", []))
+            points = tuple(
+                tuple(pt) for pt in raw_points
+                if isinstance(pt, (list, tuple)) and len(pt) == 3)
         except (TypeError, ValueError):
+            continue
+        if len(points) != len(raw_points):
             continue
         if not points or not type_name:
             continue
@@ -409,6 +620,17 @@ def _restore_variants(game, variants_data):
             (int(c[0]), int(c[1]))
             for c in vd.get("dig_cells", [])
             if isinstance(c, (list, tuple)) and len(c) >= 2)
+        version = vd.get("version", -1)
+        if not isinstance(version, int):
+            try:
+                version = int(version)
+            except (TypeError, ValueError):
+                version = -1
+        # 陈旧变体（存档时已被 invalidate 标脏，version=-1）不复活：
+        # 否则读档会把旧世界算出的路径当成当前版本，敌人沿它穿过新塔/新挖地形
+        # （BUG-072）。缺省让它惰性重算。
+        if version < 0 or version != game.universe.world_version:
+            continue
         pd = PathData(
             points=points,
             length=vd.get("length", len(points)),
@@ -455,7 +677,7 @@ def _restore_camera(cam, cam_data):
 def _restore_towers(data, towers_data):
     """从存档重建塔列表。未知类型跳过+警告。"""
     from entities import TOWER_TYPES, Tower
-    from items import CLASSIC_TOWER_MATERIALS, WEAPON_TYPES
+    from items import CLASSIC_TOWER_MATERIALS, WEAPON_TYPES, PROCESS_RECIPES
     towers = []
     for td in towers_data:
         type_name = td.get("type_name", "")
@@ -498,10 +720,13 @@ def _restore_towers(data, towers_data):
         if src and len(src) >= 2:
             tower.source = (src[0], src[1])
         mat_recipe = td.get("material_recipe")
-        if mat_recipe is None:
-            tower.material_recipe = dict(CLASSIC_TOWER_MATERIALS.get(type_name, {}))
-        else:
+        if mat_recipe is not None:
             tower.material_recipe = dict(mat_recipe)
+        elif not tower.material_recipe:
+            # 旧档无 material_recipe 字段时才兜底（BUG-073）：武器派生塔的
+            # 配方已由 from_weapon 按武器定义填好，不能被空 dict 覆盖。
+            # 经典塔此处本为空，按经典配方兜底。
+            tower.material_recipe = dict(CLASSIC_TOWER_MATERIALS.get(type_name, {}))
         # 防御塔挂载武器（v6+；旧档无此字段 → 空列表，兼容）
         for mw in td.get("mounted_weapons") or []:
             wdef = WEAPON_TYPES.get(mw.get("weapon"))
@@ -511,12 +736,229 @@ def _restore_towers(data, towers_data):
             if not tower.mount_weapon(wdef,
                                       damage_mult=float(mw.get("damage_mult", 1.0))):
                 break  # 槽位已满：不再挂更多
+            # 冷却倒计时（BUG-074）：mount_weapon 把 timer 归零，会让读档后
+            # 武器立刻开火。按存档恢复 mid-cooldown 状态。clamp 到 [0, cooldown]
+            # 防御旧档/异常值出现负数或超长冷却。
+            mt = mw.get("timer")
+            if isinstance(mt, (int, float)) and mt > 0:
+                tower.weapon_mounts[-1]["timer"] = min(float(mt),
+                                                       float(wdef.cooldown))
+        # 仓储塔存物（v7+；旧档无此字段 → 空，兼容）
+        storage = td.get("storage")
+        if storage and getattr(tower, "storage_capacity", 0):
+            st = tower.storage
+            st["materials"] = {str(k): int(v)
+                               for k, v in (storage.get("materials") or {}).items()}
+            st["weapons"] = {str(k): int(v)
+                             for k, v in (storage.get("weapons") or {}).items()}
+            st["tools"] = set(storage.get("tools") or [])
+        # 加工塔存物与在制任务（v6+；旧档无此字段 → 空，兼容）
+        processing = td.get("processing")
+        if processing and getattr(tower, "processing_capacity", 0):
+            pt = tower.processing
+            pt["materials"] = {str(k): int(v)
+                               for k, v in (processing.get("materials") or {}).items()}
+            pt["weapons"] = {str(k): int(v)
+                             for k, v in (processing.get("weapons") or {}).items()}
+            pt["tools"] = set(processing.get("tools") or [])
+            mr = processing.get("manual_recipe")
+            # 只恢复无工具要求的配方（requires_tool 配方须工具在塔，自动线自理）
+            if (mr and mr in PROCESS_RECIPES
+                    and not PROCESS_RECIPES[mr].get("requires_tool")):
+                tower.manual_recipe = mr
+            for jk, jv in (processing.get("jobs") or {}).items():
+                if isinstance(jk, str) and jk in PROCESS_RECIPES \
+                        and isinstance(jv, (int, float)) and jv >= 0:
+                    tower.process_jobs[str(jk)] = float(jv)
+            # 恢复开工时冻结的产量/耗时（旧档无此字段 → 缺省，按当前工具重算）
+            for mk, mv in (processing.get("meta") or {}).items():
+                if isinstance(mk, str) and mk in PROCESS_RECIPES \
+                        and isinstance(mv, dict):
+                    y = mv.get("yield")
+                    d = mv.get("duration")
+                    if isinstance(y, (int, float)) and isinstance(d, (int, float)):
+                        tower.process_meta[str(mk)] = {"yield": int(y), "duration": float(d)}
+        # 传送带导出白名单（v7+；旧档无此字段 → 空集，兼容）
+        for mat in td.get("belt_export") or ():
+            if isinstance(mat, str) and mat:
+                tower.belt_export.add(mat)
+        # 电力塔（v8+）：电站燃料桶 / 电池储能（旧档缺省为空）
+        pf = td.get("power_fuel")
+        if isinstance(pf, dict):
+            for k, v in pf.items():
+                if isinstance(k, str) and isinstance(v, (int, float)) and v > 0:
+                    tower.power_fuel[k] = int(v)
+        cj = td.get("charge_j")
+        if isinstance(cj, (int, float)) and cj >= 0:
+            tower.charge_j = float(cj)
+        # 电站逐帧小数燃料累加器（BUG-129）：与 power_fuel 一同恢复，避免读档
+        # 把累计的不足一件燃料的消耗义务清零。旧档无此字段 → 保持默认 0.0。
+        fa = td.get("fuel_need_acc")
+        if isinstance(fa, (int, float)):
+            tower._fuel_need_acc = float(fa)
+        # 开采塔（v9+）：足迹 / 竖井前沿与进度（旧档缺省 → 默认与空）
+        mining = td.get("mining")
+        if mining and getattr(tower, "is_mining", False):
+            fp = mining.get("footprint")
+            if isinstance(fp, (list, tuple)) and len(fp) == 2:
+                try:
+                    m, n = int(fp[0]), int(fp[1])
+                except (TypeError, ValueError):
+                    m = n = 0
+                fmin = int(tower.type_def.mining_attr("footprint_min", 3))
+                fmax = int(tower.type_def.mining_attr("footprint_max", 7))
+                if fmin <= m <= fmax and fmin <= n <= fmax:
+                    tower.footprint = (m, n)
+            for k, v in (mining.get("start_surface") or {}).items():
+                if isinstance(k, str) and "," in k:
+                    try:
+                        cx, cz = (int(p) for p in k.split(",", 1))
+                        tower.mine_start_surface[(cx, cz)] = int(v)
+                    except (TypeError, ValueError):
+                        continue
+            for k, v in (mining.get("shaft") or {}).items():
+                if isinstance(k, str) and "," in k and isinstance(v, (list, tuple)) and len(v) == 2:
+                    try:
+                        cx, cz = (int(p) for p in k.split(",", 1))
+                        front = int(v[0])
+                        tower.mine_shaft[(cx, cz)] = {
+                            "front": front if front >= 0 else None,
+                            "timer": float(v[1]),
+                        }
+                    except (TypeError, ValueError):
+                        continue
+        # 研究塔（v10+）：current/timer/total + 排队列表（旧档缺省 → 空）
+        if getattr(tower, "is_research", False):
+            import tech_tree as tt
+            tree = tt.tech_tree()
+            rd = td.get("research")
+            if isinstance(rd, dict):
+                cur = rd.get("current")
+                if isinstance(cur, str) and cur in tree.nodes:
+                    tower.research_current = cur
+                    tmr = rd.get("timer", 0.0)
+                    ttl = rd.get("total", 0.0)
+                    if isinstance(tmr, (int, float)) and tmr >= 0:
+                        tower.research_timer = float(tmr)
+                    if isinstance(ttl, (int, float)) and ttl > 0:
+                        tower.research_total = float(ttl)
+                # 排队列表：仅保留已知节点、去重、剔除已解锁
+                unlocked = set((data.get("tech") or {}).get("unlocked", []))
+                seen = set()
+                for qid in (rd.get("queue") or []):
+                    if not isinstance(qid, str) or qid not in tree.nodes:
+                        print(f"[存档] 跳过未知排队科技: {qid!r}")
+                        continue
+                    if qid in seen or qid in unlocked:
+                        continue
+                    seen.add(qid)
+                    tower.research_queue.append(qid)
         towers.append(tower)
     return towers
 
 
-def _restore_enemies(data, universe, enemies_data):
-    """从存档重建敌人列表。未知类型/路径越界兜底。"""
+def _restore_base_research(game, tech_data):
+    """恢复基地手研通道（station=false 科技，无需研究塔；v11+，旧档缺省为空）。
+
+    只接受已知节点；排队去重、剔除已解锁，与塔 research 段同规则。
+    """
+    br = getattr(game, "base_research", None)
+    if br is None:
+        return
+    import tech_tree as tt
+    tree = tt.tech_tree()
+    rd = tech_data.get("base_research") or {}
+    if not isinstance(rd, dict):
+        return
+    cur = rd.get("current")
+    if isinstance(cur, str) and cur in tree.nodes:
+        br.research_current = cur
+        tmr = rd.get("timer", 0.0)
+        ttl = rd.get("total", 0.0)
+        if isinstance(tmr, (int, float)) and tmr >= 0:
+            br.research_timer = float(tmr)
+        if isinstance(ttl, (int, float)) and ttl > 0:
+            br.research_total = float(ttl)
+    # 排队列表：仅保留已知节点、去重、剔除已解锁
+    unlocked = set((tech_data.get("unlocked") or []))
+    seen = set()
+    for qid in (rd.get("queue") or []):
+        if not isinstance(qid, str) or qid not in tree.nodes:
+            print(f"[存档] 跳过未知排队科技: {qid!r}")
+            continue
+        if qid in seen or qid in unlocked:
+            continue
+        seen.add(qid)
+        br.research_queue.append(qid)
+
+
+def _restore_belts(data, belts_data, universe):
+    """从存档重建传送带列表。未知类型跳过+警告；y 由地表重算。"""
+    from belts import Belt
+    belts = []
+    for bd in belts_data:
+        kind = bd.get("kind", "")
+        if kind not in ("belt", "splitter", "bridge"):
+            print(f"[存档] 跳过未知传送带类型: {kind!r}")
+            continue
+        try:
+            cell = (int(bd["cell"][0]), int(bd["cell"][1]))
+        except (KeyError, TypeError, ValueError, IndexError):
+            continue
+        direction = int(bd.get("direction", 1)) % 4
+        y = float(universe.surface_height_at(cell[0], cell[1]) + 1)
+        belt = Belt(kind, direction, cell, y)
+        belt.counter = int(bd.get("counter", 0) or 0)
+        if kind == "bridge":
+            lanes_data = bd.get("lanes") or []
+            for li, lane_data in enumerate(lanes_data):
+                if li >= len(belt.lanes):
+                    break
+                items = []
+                for it in lane_data.get("items") or ():
+                    try:
+                        items.append({"name": str(it[0]), "head": float(it[1])})
+                    except (TypeError, ValueError, IndexError):
+                        continue
+                belt.lanes[li]["items"] = items
+        else:
+            items = []
+            for it in bd.get("items") or ():
+                try:
+                    items.append({"name": str(it[0]), "head": float(it[1])})
+                except (TypeError, ValueError, IndexError):
+                    continue
+            belt.items = items
+        belts.append(belt)
+    return belts
+
+
+def _restore_wires(data, wires_data, universe):
+    """从存档重建电线列表。未知类型跳过+警告；y 由地表重算。"""
+    from power import CableSegment
+    wires = []
+    for wd in wires_data:
+        kind = wd.get("kind", "")
+        if kind not in gamedata.WIRES_RAW:
+            print(f"[存档] 跳过未知电线类型: {kind!r}")
+            continue
+        try:
+            cell = (int(wd["cell"][0]), int(wd["cell"][1]))
+        except (KeyError, TypeError, ValueError, IndexError):
+            continue
+        y = float(universe.surface_height_at(cell[0], cell[1]) + 1)
+        wire = CableSegment(kind, cell, y)
+        wire.trip_timer = float(wd.get("trip_timer", 0.0) or 0.0)
+        wire.tripped = bool(wd.get("tripped", False))
+        wires.append(wire)
+    return wires
+
+
+def _restore_enemies(data, universe, enemies_data, pathfinder=None, towers=None):
+    """从存档重建敌人列表。未知类型/路径越界兜底。
+
+    towers: 已还原的塔列表，用于把 attack_target 索引还原成引用（BUG-070）。
+    """
     from entities import ENEMY_TYPES, Enemy
     enemies = []
     paths = universe.enemy_paths
@@ -531,22 +973,86 @@ def _restore_enemies(data, universe, enemies_data):
         except (TypeError, ValueError):
             continue
         path_ref = ed.get("path_ref", 0)
-        if isinstance(path_ref, (int, float)):
-            path = paths.get(int(path_ref))
-        else:
+        if not isinstance(path_ref, (int, float)):
+            path_ref = -1
+        # 变体集优先：读档敌人应挂在它实际使用的变体路径上，而非主线。
+        # 主线与变体点集不同，把保存的 path_index 直接套到主线上会跳点/跟错路
+        # （原实现只存 path_ref=home_spawner_id，读档总是挂主线）。
+        sid = ed.get("home_spawner_id", -1)
+        if not isinstance(sid, (int, float)):
+            sid = -1
+        sid = int(sid)
+        behavior = ed.get("behavior", "wave")
+        path = None
+        all_paths = []
+        # 侦察怪（BUG-075）：活体侦察怪由 Enemy.as_scout 用 path=None、
+        # all_paths=[None] 构造（entities.py），路径字段对它无意义——移动只看
+        # wander_heading/return_path。这里同样跳过变体/主线解析，保持 path=None。
+        # 围攻/挖掘（attack_tower/dig）虽然不靠 path 移动，但它们交战前是沿
+        # 本刷怪点路线行走的，且回到 wave 的状态迁移不会重寻路（BUG-127）：
+        # 不给它们恢复路径会让读档后 path_points=()，下一帧被误判"抵达大本营"
+        # 而直接移除。因此除侦察怪外一律恢复变体/主线（含 attack_tower/dig）。
+        is_scout = behavior in ("scout_wander", "scout_return")
+        needs_path = not is_scout
+        if needs_path and pathfinder is not None:
+            variant_entry = pathfinder.variants.get((sid, type_name))
+            if variant_entry:
+                variants = variant_entry.get("paths") or []
+                # 仅当敌人存档时真的走在变体路径上才挂变体（BUG-076）。
+                # 旧档无 on_variant 字段（缺省 False）一律走主线兜底。
+                if variants and ed.get("on_variant", False):
+                    pv = ed.get("path_variant", 0)
+                    if not isinstance(pv, int) or not (0 <= pv < len(variants)):
+                        pv = 0
+                    path = variants[pv]
+                    all_paths = variants
+        if needs_path and path is None:
+            # 主线敌人：只挂自己刷怪点的主线（BUG-077），不再展开全部刷怪点路线。
+            own = paths.get(int(path_ref))
+            if own is not None:
+                path = own
+                all_paths = [own]
+            else:
+                # 自己刷怪点主线缺失（旧/残缺档）→ 丢弃该敌人（BUG-078）：
+                # 绝不路由到别的刷怪点路线（原 next(iter(paths.values())) 会走错路）；
+                # 也不给 None 路径的 wave 怪（会因 path_index>=0 立刻判"抵达大本营"）。
+                continue
+        path_index = 0 if path is None else ed.get("path_index", 0)
+        if path is not None and path.points:
+            # BUG-103：存档里的 path_index 可能来自更长的历史/变体路径，
+            # 恢复出的路径较短时越界 → 敌人直接进"到达大本营"分支、位置
+            # 又低于基地层无法结算，读档后永久站立不走。夹到合法范围。
+            path_index = min(path_index, len(path.points) - 1)
+        # R3-H1：读档保持"原地等待"（BUG-105，无解重寻路清空路径的标记）。
+        # 此时不恢复任何路径（path_points=()，同活体等待态语义），否则敌人
+        # 恢复出主线末段、walking 态被动走向大本营，走完末段即被结算
+        # reached_base。地形编辑（world_version bump）会触发重估自愈。
+        waiting_for_path = bool(ed.get("waiting_for_path", False))
+        if waiting_for_path and needs_path:
             path = None
-        if path is None and paths:
-            path = next(iter(paths.values()))
-        path_index = ed.get("path_index", 0)
-        if path is None:
+            all_paths = []
             path_index = 0
-        all_paths = list(paths.values()) if paths else []
-        enemy = Enemy(et, pos, path, all_paths=all_paths, path_index=path_index)
+        # 注入 universe 的种子随机源（BUG-131）：不传 rng 会让 Enemy 内部回退到
+        # 模块级 random，破坏活体敌人（game 传入 universe.rng）的种子可复现性。
+        # 个体 wobble 参数另行从存档覆盖（下方），此处只保证运行时随机流一致。
+        # #4 读档 RNG 脱同步：不能直接把 universe.rng 传给构造器——Enemy.__init__
+        # 会消费 8 个随机数（wobble_amp/freq/phase/time/path_noise/repath_timer/
+        # wander_heading），而这些值随后被存档覆盖；若用 universe.rng 构造，
+        # 读档后随机流被额外推进 N×8 步，与"存档点继续在线播放"脱同步。
+        # 因此构造用一次性独立 rng（只生成会被覆盖的占位值），之后再把手动
+        # 选择的种子源挂回 enemy.rng，运行时决策由此继续从 universe.rng 取数。
+        enemy = Enemy(et, pos, path,
+                      all_paths=(all_paths if path is not None else None),
+                      path_index=path_index,
+                      rng=random.Random())
+        enemy.rng = universe.rng
         # 覆盖所有个体属性
         enemy.health = ed.get("health", enemy.health)
         enemy.max_health = ed.get("max_health", enemy.max_health)
         enemy.speed = ed.get("speed", enemy.speed)
         enemy.reward = ed.get("reward", enemy.reward)
+        # #2 掉落波次口径：旧档无该字段时回落默认 0（击杀掉落回落全局 wave）。
+        enemy.spawn_wave = ed.get("spawn_wave", 0)
         enemy.active = ed.get("active", True)
         enemy.slow_timer = ed.get("slow_timer", 0.0)
         enemy.slow_factor = ed.get("slow_factor", 1.0)
@@ -558,8 +1064,18 @@ def _restore_enemies(data, universe, enemies_data):
         personality = ed.get("personality")
         if personality and isinstance(personality, dict):
             enemy.personality = dict(personality)
+        # 非标准侦察兵配置（BUG-071）：还原个体 kind 参数，避免退回标准侦察兵
+        sc = ed.get("scout_cfg")
+        if sc and isinstance(sc, dict):
+            enemy.scout_cfg = dict(sc)
         # 行为状态机字段（v2+，旧存档用 getattr 兜底默认值）
         enemy.behavior = ed.get("behavior", "wave")
+        # 攻击目标（BUG-070）：按 game.towers 索引还原引用。不还原会让
+        # 攻塔中的敌人读档后 attack_target=None，下一帧弃攻回 wave。
+        at_idx = ed.get("attack_target")
+        if (enemy.behavior == "attack_tower" and isinstance(at_idx, int)
+                and towers is not None and 0 <= at_idx < len(towers)):
+            enemy.attack_target = towers[at_idx]
         enemy.home_spawner_id = ed.get("home_spawner_id", -1)
         enemy.has_message = ed.get("has_message", False)
         enemy.scout_returned_with_message = ed.get("scout_returned_with_message", False)
@@ -581,7 +1097,12 @@ def _restore_enemies(data, universe, enemies_data):
         enemy.dig_y = ed.get("dig_y")
         enemy.dig_base_y = ed.get("dig_base_y")
         enemy.dig_passed = bool(ed.get("dig_passed", False))
+        enemy._dug_count = int(ed.get("dug_count", 0) or 0)
+        enemy._dig_marked_passage = bool(ed.get("dig_marked_passage", False))
         enemy.repath_timer = ed.get("repath_timer", 0.0)
+        # R3-H1：恢复"原地等待"标记（旧档无此字段默认 False）。标记置位时
+        # 上方已把路径清空，保持活体等待态语义。
+        enemy.waiting_for_path = waiting_for_path
         enemies.append(enemy)
     return enemies
 
@@ -729,16 +1250,43 @@ def deserialize_game(data: dict):
     game.inventory.weapons = dict(inv.get("weapons", {}))
     game.inventory.tools = set(inv.get("tools", []))
 
-    # 10) 科技
+    # 10) 科技（v10+：研究状态按塔恢复，见 _restore_towers 的 research 段；
+    #     v11+：基地手研通道 base_research）
     tech = data.get("tech") or {}
     game.unlocked_tech = set(tech.get("unlocked", []))
-    game.tech_researching = tech.get("researching")
-    game.tech_research_timer = tech.get("research_timer", 0.0)
-    game.tech_research_total = tech.get("research_total", 0.0)
+    _restore_base_research(game, tech)
 
     # 11) 实体
     game.towers = _restore_towers(data, data.get("towers") or [])
-    game.enemies = _restore_enemies(data, universe, data.get("enemies") or [])
+    # 读档后重新登记塔格（BUG-017）：Universe(seed) 的 _tower_cells/_wall_cells
+    # 为空，寻路读这两个集合，不重登记会让敌人穿塔、城墙失效。
+    for _t in game.towers:
+        if not getattr(_t, "active", True):
+            continue
+        if getattr(_t, "is_mining", False):
+            for _cx, _cz in _t.footprint_cells():
+                universe.add_tower_cell(_cx, _cz, is_wall=_t.no_attack)
+        else:
+            universe.add_tower_cell(math.floor(_t.position[0]),
+                                    math.floor(_t.position[2]),
+                                    is_wall=_t.no_attack)
+    # 重戳变体缓存版本号（BUG-134）：上面的 add_tower_cell 会推进
+    # universe.world_version，而 pathfinder._seen_version 仍是构造时的 -1。
+    # 读档后首次 begin_frame() 会因 -1 != world_version 触发 invalidate()，
+    # 把 _restore_variants 刚按旧 version 存入的变体全部标脏、每帧重算一遍，
+    # 使存档里的 variants 永远不生效。塔/地形与变体计算时完全一致，重戳合法。
+    _pf = getattr(game, "pathfinder", None)
+    if _pf is not None:
+        _pf._seen_version = game.universe.world_version
+        for _entry in _pf.variants.values():
+            _entry["version"] = game.universe.world_version
+    game.belts = _restore_belts(data, data.get("belts") or [], universe)
+    game._belt_by_cell = {b.cell: b for b in game.belts}
+    game.wires = _restore_wires(data, data.get("wires") or [], universe)
+    game._wire_by_cell = {w.cell: w for w in game.wires}
+    game.enemies = _restore_enemies(data, universe, data.get("enemies") or [],
+                                    pathfinder=game.pathfinder,
+                                    towers=game.towers)
     game.projectiles = _restore_projectiles(data, game.towers, data.get("projectiles") or [])
     game.pickups = _restore_pickups(data.get("pickups") or [])
 
@@ -749,6 +1297,13 @@ def deserialize_game(data: dict):
     game.placement_position = None
     game.interaction_mode = "none"
     game.selected_weapon = None
+    game.placing_belt = False
+    game.selected_belt = None
+    game.belt_direction = 1
+    game.placing_wire = False
+    game.selected_power = None
+    game.power_kind_sel = "wire"
+    game.power_state = None
     game.craft_panel_open = False
     game.craft_timer = 0.0
     game.craft_action = None
@@ -873,6 +1428,95 @@ def migrate_v4_to_v5(data: dict) -> dict:
     return data
 
 
+def migrate_v5_to_v6(data: dict) -> dict:
+    """将 v5 存档迁移到 v6（加工塔）。
+
+    v6 新增：processing 存物/在制任务/手动配方字段（旧档缺字段宽松兜底为空）。
+    结构兼容：缺失字段由 _restore_towers .get() 兜底，此处仅推进版本号。
+    """
+    data["version"] = 6
+    return data
+
+
+def migrate_v6_to_v7(data: dict) -> dict:
+    """将 v6 存档迁移到 v7（传送带物流）。
+
+    v7 新增：game.belts 列表 + 塔 belt_export 导出白名单（旧档缺省为空）。
+    结构兼容：缺失段由 _restore_belts / _restore_towers .get() 兜底。
+    """
+    data["belts"] = data.get("belts") or []
+    data["version"] = 7
+    return data
+
+
+def migrate_v7_to_v8(data: dict) -> dict:
+    """将 v7 存档迁移到 v8（电力系统）。
+
+    v8 新增：game.wires 列表（电线）+ 电力塔（电站/电池）燃料桶/电池储能字段。
+    结构兼容：缺失段由 _restore_wires / _restore_towers .get() 兜底。
+    """
+    data["wires"] = data.get("wires") or []
+    data["version"] = 8
+    return data
+
+
+def migrate_v8_to_v9(data: dict) -> dict:
+    """将 v8 存档迁移到 v9（开采塔）。
+
+    v9 新增：塔 mining 段（足迹/竖井前沿与进度）。旧档开采塔不存在，
+    此段缺省即可，无需改动（_restore_towers .get() 兜底为空）。
+    """
+    data["version"] = 9
+    return data
+
+
+def migrate_v9_to_v10(data: dict) -> dict:
+    """将 v9 存档迁移到 v10（按塔研究）。
+
+    v10 结构性变化：研究状态从全局 tech 段迁到各研究塔的 research 段
+    （current/timer/total/queue 队列）。旧档只有一个全局在研槽：
+      - 有研究塔 → 写入第一座研究塔的 research.current（保留剩余计时）；
+      - 无研究塔 → 丢弃并打印警告（旧语义下该研究本来也靠研究塔承载）。
+    旧 tech 段 researching/research_timer/research_total 字段删除。
+    """
+    tech = data.get("tech") or {}
+    old_researching = tech.get("researching")
+    if old_researching:
+        target = None
+        for td in data.get("towers") or []:
+            tname = td.get("type_name", "")
+            from entities import TOWER_TYPES
+            ttdef = TOWER_TYPES.get(tname)
+            if ttdef is not None and int(getattr(ttdef, "research_attr", 0) or 0) > 0:
+                target = td
+                break
+        if target is not None:
+            target["research"] = {
+                "current": old_researching,
+                "timer": float(tech.get("research_timer", 0.0) or 0.0),
+                "total": float(tech.get("research_total", 0.0) or 0.0),
+                "queue": [],
+            }
+            print(f"[存档] v9→v10: 全局研究 {old_researching!r} 迁入研究塔")
+        else:
+            print(f"[存档] v9→v10: 无研究塔，丢弃在研科技 {old_researching!r}")
+    # 删除旧全局研究字段
+    for k in ("researching", "research_timer", "research_total"):
+        tech.pop(k, None)
+    data["version"] = 10
+    return data
+
+
+def migrate_v10_to_v11(data: dict) -> dict:
+    """将 v10 存档迁移到 v11（基地手研通道）。
+
+    v11 新增：tech.base_research（station=false 科技，无需研究塔）。
+    纯增量字段：旧档缺省为空（_restore_base_research .get() 兜底），无破坏。
+    """
+    data["version"] = 11
+    return data
+
+
 def migrate_v1_to_v2(data: dict) -> dict:
     """将 v1 存档（全局波次）迁移到 v2（刷怪点独立波次）。
 
@@ -954,6 +1598,12 @@ def load_game(path) -> "Game | None":
         print(f"[存档] 读取失败: {path} ({e})")
         return None
 
+    # 合法 JSON 但不是对象（数组/字符串等）：按契约失败返回 None，
+    # 避免 data.get() 抛未捕获 AttributeError
+    if not isinstance(data, dict):
+        print(f"[存档] 存档内容不是对象: {path}")
+        return None
+
     # 版本检查与迁移
     ver = data.get("version", 0)
     if ver > config.SAVE_VERSION:
@@ -967,6 +1617,23 @@ def load_game(path) -> "Game | None":
             data = migrate_v3_to_v4(data)
         if data.get("version", 1) == 4:
             data = migrate_v4_to_v5(data)
+        if data.get("version", 1) == 5:
+            data = migrate_v5_to_v6(data)
+        if data.get("version", 1) == 6:
+            data = migrate_v6_to_v7(data)
+        if data.get("version", 1) == 7:
+            data = migrate_v7_to_v8(data)
+        if data.get("version", 1) == 8:
+            data = migrate_v8_to_v9(data)
+        if data.get("version", 1) == 9:
+            data = migrate_v9_to_v10(data)
+        if data.get("version", 1) == 10:
+            data = migrate_v10_to_v11(data)
+
+    # BUG-098 存档兼容：刷怪点 id 编码变更后，旧档 id 需重映射为新编码，
+    # 否则 _restore_spawner_positions 会因 id 不符丢弃刷怪点。已是新编码则跳过。
+    if _spawner_ids_need_reencode(data):
+        _reencode_spawner_ids(data)
 
     try:
         game = deserialize_game(data)
@@ -987,14 +1654,34 @@ def list_saves() -> list:
         try:
             with open(fpath, "r", encoding="utf-8") as f:
                 data = json.load(f)
-            wave = data.get("game", {}).get("wave", 0)
+            if not isinstance(data, dict):
+                raise ValueError("存档内容不是对象")
+            # 用 `or {}` 而非默认 {}：'game' 键存在但为 null/非字典时，
+            # .get 返回该值，链式 .get('wave') 会抛 AttributeError（BUG-069）
+            wave = (data.get("game") or {}).get("wave", 0) if isinstance(
+                data.get("game"), dict) else 0
             seed = data.get("seed", 0)
-            created_at = data.get("created_at", os.path.getmtime(fpath))
-        except (json.JSONDecodeError, OSError, KeyError):
+            # R1-A3：created_at 非数值（如字符串）时不得入库——与浮点并存时
+            # 下方 sort 混合比较 TypeError；单存档时 format_time→time.localtime(str)
+            # 也 TypeError → 入口浏览器/F8 菜单崩溃。非数值回落文件 mtime。
+            created_at = data.get("created_at", None)
+            if not isinstance(created_at, (int, float)) \
+                    or isinstance(created_at, bool):
+                created_at = None
+        except (json.JSONDecodeError, OSError, KeyError, ValueError, TypeError):
             wave = 0
             seed = 0
-            created_at = os.path.getmtime(fpath)
-        size = os.path.getsize(fpath)
+            created_at = None
+        # R2-F1：stat 阶段（getsize/getmtime）与坏 JSON 同容错——open 读到
+        # 内容与下方 stat 之间文件被外部删除/锁（外部清理、杀毒扫描）即抛
+        # 未捕获 OSError，沿 _open_save_menu/SeedScreen 冒泡崩整个存档浏览器。
+        # 同函数对坏 JSON/非 dict 存档都有"跳过坏文件"容错，唯独 stat 漏保护。
+        try:
+            if created_at is None:
+                created_at = os.path.getmtime(fpath)
+            size = os.path.getsize(fpath)
+        except OSError:
+            continue  # 文件刚被外部删除/锁住：跳过该项，不崩浏览器
         results.append({
             "name": fname,
             "path": fpath,

@@ -20,7 +20,6 @@
         "wander_speed_mult": 0.8,
         "turn_interval": 1.2,
         "wander_turn": 1.0,
-        "noise_bias": 0.7,
         "noise_jitter": 0.5,
         "probe_dist": 4,
         "meet_radius": 8.0,
@@ -28,7 +27,7 @@
       }
     },
     "highland": {
-      "biomes": ["mountain", "tundra"],
+      "biomes": ["mountain", "tundra", "snowy"],
       "trigger_radii": {"presence": 30.0, "build": 45.0, "combat": 60.0, "edit": 35.0},
       "scout": {
         "enemy_type": "fast",
@@ -38,7 +37,6 @@
         "wander_speed_mult": 0.75,
         "turn_interval": 1.0,
         "wander_turn": 1.2,
-        "noise_bias": 0.8,
         "noise_jitter": 0.4,
         "probe_dist": 5,
         "meet_radius": 8.0,
@@ -56,7 +54,6 @@
         "wander_speed_mult": 0.7,
         "turn_interval": 1.4,
         "wander_turn": 0.9,
-        "noise_bias": 0.6,
         "noise_jitter": 0.6,
         "probe_dist": 4,
         "meet_radius": 8.0,

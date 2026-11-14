@@ -2,20 +2,33 @@
 gamedata.py - 数据加载器：游戏启动时从 data/*.json 读取全部配置数据。
 
 设计原则：
-  - 只依赖标准库（json/os），不 import 任何游戏模块 → 无循环依赖。
+  - 核心只依赖标准库（json/os）；校验器（validate_data，导入即执行）会
+    import blocks/biomes 做方块/群系名引用校验——它们也是纯数据模块，
+    不构成循环依赖（R7-P3：原 docstring"不 import 任何游戏模块"失实）。
   - 所有数值的“唯一事实来源”在 data/*.json；本模块做结构校验与默认值归一。
   - 上层模块（config/items/entities/game/world）从这里取数据并构建运行时对象。
 
-数据文件：
-  tech.json      科技树 + 科技效果 + 说明          → TECH_TREE / TECH_EFFECTS / TECH_DESC
-  recipes.json   材料/加工配方/工具/武器/拆除比例   → PROCESS_RECIPES / TOOLS_RAW / WEAPONS_RAW /
-                                                     MATERIAL_* / RAW / PROCESSED / CLASSIC_TOWER_MATERIALS / DISMANTLE_REFUND
-  enemies.json   敌人类型 + 掉落 + 全局 + 地形速度  → ENEMIES_RAW / DROP_TABLES / ENEMY_GLOBAL / TERRAIN_SPEED_MULTS / ENEMY_COLORS / ENEMY_PERSONALITIES
-  spawners.json  刷怪点分布 + 种类 + 侦察兵属性     → SPAWNERS_CFG / SPAWNER_GRID / spawner_kind() / spawner_kind_for() / STANDARD_SCOUT
-  waves.json     波次构成表                        → WAVE_TABLE / WAVE_FALLBACK
-  towers.json    塔类型                            → TOWERS_RAW / TOWER_COLORS
+数据文件（9 个）：
+  tech.json      科技树（时代/类别/成果/突破点）+ 科技效果 → TECH_ACHIEVEMENTS / TECH_BREAKTHROUGHS /
+                                                           TECH_ERAS / TECH_CATEGORIES / TECH_EFFECTS /
+                                                           TECH_IDS / TECH_EFFECT_NODES（v1 档走 TECH_TREE 兼容）
+  recipes.json   材料/加工配方/工具/武器/拆除比例          → PROCESS_RECIPES / TOOLS_RAW / WEAPONS_RAW /
+                                                           MATERIAL_COLORS / MATERIAL_NAMES_CN / RAW / PROCESSED /
+                                                           CLASSIC_TOWER_MATERIALS / DISMANTLE_REFUND
+  enemies.json   敌人类型 + 掉落 + 全局 + 地形速度          → ENEMIES_RAW / DROP_TABLES / ENEMY_GLOBAL /
+                                                           TERRAIN_SPEED_MULTS / ENEMY_COLORS / ENEMY_PERSONALITIES /
+                                                           ENEMY_ENVIRONMENTS / ENEMY_ATTACKS
+  spawners.json  刷怪点分布 + 种类 + 侦察兵属性             → SPAWNERS_CFG / SPAWNER_GRID / spawner_kind() /
+                                                           spawner_kind_for() / STANDARD_SCOUT
+  waves.json     波次构成表                               → WAVE_TABLE / WAVE_FALLBACK
+  towers.json    塔类型                                   → TOWERS_RAW / TOWER_COLORS / TOWER_HP /
+                                                           CLASSIC_TOWER_MATERIALS / TOWER_MINING_CFG
+  belts.json     传送带类型                               → BELTS_RAW / BELT_COLORS
+  wires.json     电线类型                                 → WIRES_RAW / WIRE_COLORS
+  power.json     电站/电池/燃料                            → STATIONS_RAW / BATTERIES_RAW / FUELS_DATA /
+                                                           VOLTAGE_CLASS_NOMINAL
 
-改数值/加内容：编辑对应 JSON 即可，无需改 Python。
+改数值/加内容：编辑对应 JSON 即可，无需改 Python（消费方直读上面的 *_RAW 表）。
 """
 
 import json
@@ -43,6 +56,9 @@ ENEMIES_DATA = _load("enemies.json")
 SPAWNERS_DATA = _load("spawners.json")
 WAVES_DATA = _load("waves.json")
 TOWERS_DATA = _load("towers.json")
+BELTS_DATA = _load("belts.json")
+WIRES_DATA = _load("wires.json")
+POWER_DATA = _load("power.json")
 
 
 # ─── 科技 ─────────────────────────────────────────────────────
@@ -83,8 +99,6 @@ else:
     TECH_ACHIEVEMENTS = {}
     TECH_BREAKTHROUGHS = {}
     TECH_LEGACY_MAP = {}
-
-TECH_DESC = {name: td.get("desc", td.get("name_cn", "")) for name, td in TECH_TREE.items()}
 
 # 制作门控的唯一真源：突破点 ID 集合。requires_tech 只能引用这里面的 ID，
 # 否则该门控永不可达（历史上 legacy ID 与新树并存时静默失效过）。
@@ -135,6 +149,41 @@ TOWER_HP = {name: td.get("base_hp", 100) for name, td in TOWERS_RAW.items()}
 # 经典塔拆除回收材料（从 towers.json 的 materials 字段派生）
 CLASSIC_TOWER_MATERIALS = {
     name: dict(td.get("materials", {})) for name, td in TOWERS_RAW.items()}
+# 开采塔配置（towers.json 的 mining 段；空 = 非开采塔）
+TOWER_MINING_CFG = {
+    name: dict(td.get("mining", {})) for name, td in TOWERS_RAW.items()
+    if td.get("mining")}
+
+
+# ─── 传送带 ───────────────────────────────────────────────────
+# 传送带/均分器/立交桥类型（data/belts.json）：name → 全部带属性
+BELTS_RAW = BELTS_DATA["belts"]        # name → {name_cn,base_cost,speed,capacity,requires_tech,color}
+BELT_COLORS = {name: _color(td["color"]) for name, td in BELTS_RAW.items()}
+
+# ─── 电线（输电介质） ─────────────────────────────────────────
+# 电线类型（data/wires.json）：name → {name_cn,base_cost,voltage_class,rated_voltage_v,
+# max_current_a,resistance_per_tile,requires_tech,color}
+WIRES_RAW = WIRES_DATA["wires"]        # name → 全部电线属性
+WIRE_COLORS = {name: _color(td["color"]) for name, td in WIRES_RAW.items()}
+
+# ─── 电力（发电站 / 电池 / 燃料 / 用电端） ────────────────────
+# 电力类型（data/power.json）：stations/batteries/fuels/consumer
+STATIONS_RAW = POWER_DATA.get("stations", {})   # name → 全部电站属性
+BATTERIES_RAW = POWER_DATA.get("batteries", {})  # name → 全部电池属性
+FUELS_DATA = POWER_DATA.get("fuels", {})         # 燃料名 → 热值(焦/件)
+
+# 电力塔并入塔颜色/生命/拆除回收材料（与经典塔统一，供 entities/render 用）
+for _sname, _sd in STATIONS_RAW.items():
+    TOWER_COLORS[_sname] = _color(_sd["color"])
+    TOWER_HP[_sname] = _sd.get("base_hp", 100)
+    CLASSIC_TOWER_MATERIALS[_sname] = dict(_sd.get("materials", {}))
+for _bname, _bd in BATTERIES_RAW.items():
+    TOWER_COLORS[_bname] = _color(_bd["color"])
+    TOWER_HP[_bname] = _bd.get("base_hp", 100)
+    CLASSIC_TOWER_MATERIALS[_bname] = dict(_bd.get("materials", {}))
+
+# 电压等级标称电压(伏)；等级 → 标称值。等级: LV=低压 MV=中压 HV=高压。
+VOLTAGE_CLASS_NOMINAL = {"LV": 220.0, "MV": 10000.0, "HV": 110000.0}
 
 
 # ─── 刷怪点 / 侦察兵 ──────────────────────────────────────────
@@ -300,7 +349,11 @@ def _collect_data_issues():
             else:
                 bad(f"recipe[{key}].requires_tech 引用了不存在的科技: {t!r}")
     for tname, tdef in TOOLS_RAW.items():
-        if tdef.get("applies") not in PROCESS_RECIPES:
+        # 采掘工具（带 mining 段）不适用于加工配方，applies 允许为空/None。
+        if tdef.get("mining"):
+            if tdef.get("applies") not in (None, ""):
+                bad(f"tool[{tname}].applies 对采掘工具应为空，却为 {tdef.get('applies')!r}")
+        elif tdef.get("applies") not in PROCESS_RECIPES:
             bad(f"tool[{tname}].applies 引用了不存在的加工配方: {tdef.get('applies')!r}")
         for m, a in tdef.get("recipe", {}).items():
             if m not in mat_names:
@@ -436,6 +489,112 @@ def _collect_data_issues():
         if not isinstance(sr, (int, float)) or sr < 0:
             bad(f"tower[{tn}].splash_radius 非法: {sr!r}")
 
+    # ── 传送带 ──
+    for bn, bdef in BELTS_RAW.items():
+        if not bdef.get("name_cn"):
+            bad(f"belt[{bn}].name_cn 缺失或为空")
+        if not isinstance(bdef.get("base_cost"), (int, float)) or bdef["base_cost"] <= 0:
+            bad(f"belt[{bn}].base_cost 非法: {bdef.get('base_cost')!r}")
+        if not isinstance(bdef.get("speed"), (int, float)) or bdef["speed"] <= 0:
+            bad(f"belt[{bn}].speed 非法: {bdef.get('speed')!r}")
+        if not isinstance(bdef.get("capacity"), (int, float)) or bdef["capacity"] <= 0:
+            bad(f"belt[{bn}].capacity 非法: {bdef.get('capacity')!r}")
+        if not _valid_color(bdef.get("color")):
+            bad(f"belt[{bn}].color 非法: {bdef.get('color')!r}")
+        for t in bdef.get("requires_tech", []) or []:
+            if t in TECH_IDS:
+                continue
+            if t in tech_names:
+                warn(f"belt[{bn}].requires_tech 仍用 legacy ID {t!r}，应迁移为对应的新突破点 ID")
+            else:
+                bad(f"belt[{bn}].requires_tech 引用了不存在的科技: {t!r}")
+
+    # ── 电线 ──
+    for wn, wdef in WIRES_RAW.items():
+        if not wdef.get("name_cn"):
+            bad(f"wire[{wn}].name_cn 缺失或为空")
+        if not isinstance(wdef.get("base_cost"), (int, float)) or wdef["base_cost"] <= 0:
+            bad(f"wire[{wn}].base_cost 非法: {wdef.get('base_cost')!r}")
+        vc = wdef.get("voltage_class")
+        if vc not in VOLTAGE_CLASS_NOMINAL:
+            bad(f"wire[{wn}].voltage_class 非法(应为 LV/MV/HV): {vc!r}")
+        if not isinstance(wdef.get("rated_voltage_v"), (int, float)) or wdef["rated_voltage_v"] <= 0:
+            bad(f"wire[{wn}].rated_voltage_v 非法: {wdef.get('rated_voltage_v')!r}")
+        if not isinstance(wdef.get("max_current_a"), (int, float)) or wdef["max_current_a"] <= 0:
+            bad(f"wire[{wn}].max_current_a 非法: {wdef.get('max_current_a')!r}")
+        if not isinstance(wdef.get("resistance_per_tile"), (int, float)) or wdef["resistance_per_tile"] < 0:
+            bad(f"wire[{wn}].resistance_per_tile 非法: {wdef.get('resistance_per_tile')!r}")
+        if not _valid_color(wdef.get("color")):
+            bad(f"wire[{wn}].color 非法: {wdef.get('color')!r}")
+        for t in wdef.get("requires_tech", []) or []:
+            if t in TECH_IDS:
+                continue
+            if t in tech_names:
+                warn(f"wire[{wn}].requires_tech 仍用 legacy ID {t!r}，应迁移为对应的新突破点 ID")
+            else:
+                bad(f"wire[{wn}].requires_tech 引用了不存在的科技: {t!r}")
+
+    # ── 发电站 ──
+    for sn, sdef in STATIONS_RAW.items():
+        if not sdef.get("name_cn"):
+            bad(f"station[{sn}].name_cn 缺失或为空")
+        oc = sdef.get("output_class")
+        if oc not in VOLTAGE_CLASS_NOMINAL:
+            bad(f"station[{sn}].output_class 非法(应为 LV/MV/HV): {oc!r}")
+        for f in ("rated_kw", "voltage_v", "base_cost", "base_hp"):
+            if not isinstance(sdef.get(f), (int, float)) or sdef[f] <= 0:
+                bad(f"station[{sn}].{f} 非法: {sdef.get(f)!r}")
+        if sdef.get("condition") not in (None, "water_adjacent", "wind", "solar"):
+            bad(f"station[{sn}].condition 非法: {sdef.get('condition')!r}")
+        eff = sdef.get("efficiency")
+        if sdef.get("fuel_types") is not None:
+            if not isinstance(eff, (int, float)) or not 0.0 < eff <= 1.0:
+                bad(f"station[{sn}].efficiency 非法(燃电站必须有 0<eff<=1): {eff!r}")
+            for fname in sdef["fuel_types"]:
+                if fname not in mat_names:
+                    bad(f"station[{sn}].fuel_types 引用了不存在的材料: {fname!r}")
+        if not _valid_color(sdef.get("color")):
+            bad(f"station[{sn}].color 非法: {sdef.get('color')!r}")
+        for m in sdef.get("materials", {}):
+            if m not in mat_names:
+                bad(f"station[{sn}].materials 引用了不存在的材料: {m!r}")
+        for t in sdef.get("requires_tech", []) or []:
+            if t in TECH_IDS:
+                continue
+            if t in tech_names:
+                warn(f"station[{sn}].requires_tech 仍用 legacy ID {t!r}，应迁移为对应的新突破点 ID")
+            else:
+                bad(f"station[{sn}].requires_tech 引用了不存在的科技: {t!r}")
+
+    # ── 电池 ──
+    for bn, bdef in BATTERIES_RAW.items():
+        if not bdef.get("name_cn"):
+            bad(f"battery[{bn}].name_cn 缺失或为空")
+        for f in ("cell_voltage_v", "cell_energy_j", "cell_max_current_a", "base_cost", "base_hp"):
+            if not isinstance(bdef.get(f), (int, float)) or bdef[f] <= 0:
+                bad(f"battery[{bn}].{f} 非法: {bdef.get(f)!r}")
+        if bdef.get("voltage_class") not in VOLTAGE_CLASS_NOMINAL:
+            bad(f"battery[{bn}].voltage_class 非法: {bdef.get('voltage_class')!r}")
+        if not _valid_color(bdef.get("color")):
+            bad(f"battery[{bn}].color 非法: {bdef.get('color')!r}")
+        for m in bdef.get("materials", {}):
+            if m not in mat_names:
+                bad(f"battery[{bn}].materials 引用了不存在的材料: {m!r}")
+        for t in bdef.get("requires_tech", []) or []:
+            if t in TECH_IDS:
+                continue
+            if t in tech_names:
+                warn(f"battery[{bn}].requires_tech 仍用 legacy ID {t!r}，应迁移为对应的新突破点 ID")
+            else:
+                bad(f"battery[{bn}].requires_tech 引用了不存在的科技: {t!r}")
+
+    # ── 燃料热值 ──
+    for fname, hv in FUELS_DATA.items():
+        if fname not in mat_names:
+            bad(f"fuels 引用了不存在的材料: {fname!r}")
+        if not isinstance(hv, (int, float)) or hv <= 0:
+            bad(f"fuels[{fname}] 热值非法: {hv!r}")
+
     # ── 刷怪点 / 侦察兵 ──
     dist = DISTRIBUTION_CFG
     for f in ("grid", "density", "base_materialize_radius", "materialize_radius",
@@ -464,10 +623,15 @@ def _collect_data_issues():
             bad(f"spawners.kinds[{kname}].scout.enemy_type 引用了不存在的敌人类型: {sc.get('enemy_type')!r}")
         if not _is_int(sc.get("batch")) or sc["batch"] < 1:
             bad(f"spawners.kinds[{kname}].scout.batch 非法: {sc.get('batch')!r}")
-        for f in ("perception_radius", "wander_duration", "wander_speed_mult",
-                  "turn_interval", "wander_turn", "noise_bias", "noise_jitter",
+        for f in ("perception_radius", "wander_duration", "turn_interval",
                   "probe_dist", "meet_radius", "edit_radius"):
             if not isinstance(sc.get(f), (int, float)) or sc[f] <= 0:
+                bad(f"spawners.kinds[{kname}].scout.{f} 缺失或非法: {sc.get(f)!r}")
+        # 以下可为 0（合法"关闭"值：关闭噪声/换向，速度倍率 0=静止）
+        # R8-R1：noise_bias 已从数据/校验移除——全库零运行时消费
+        # （侦察兵实际用 noise_jitter/wander_turn 换向，never 读 noise_bias）。
+        for f in ("wander_speed_mult", "wander_turn", "noise_jitter"):
+            if not isinstance(sc.get(f), (int, float)) or sc[f] < 0:
                 bad(f"spawners.kinds[{kname}].scout.{f} 缺失或非法: {sc.get(f)!r}")
 
     # ── 波次 ──

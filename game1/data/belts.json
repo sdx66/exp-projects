@@ -1,0 +1,29 @@
+{
+  "comment": "传送带物流系统数据。运行时由 gamedata.py 读取构建 belts.BELTS_RAW（belts.Belt 构造按 kind 直读 BELTS_RAW；不存在 belts.BELT_TYPES 属性）。\n字段: name_cn 显示名 / base_cost 建造费用 / speed 带速(格/秒,所有货物/帧推进) /\ncapacity 单格体积容量(空间单位,可载货数 = floor(capacity / item_volume)) /\nrequires_tech 科技前置(数组,引用 tech.json 突破点 ID) / color [r,g,b]。\n类型:\n  belt     传送带: 一格一段,方向 4 向(玩家 R 旋转),货物从入口侧流向出口侧。\n  splitter 均分器: 一入二出,把收到的货物均分到两条输出带(左右轮转);\n            direction 表示输入侧,两条输出为 direction 的左右各 90°。\n  bridge   立交桥: 两条互相垂直的带在同一格交叉互不影响(各走各的);\n            orientation 0-3 对应 (N→S,W→E)/(S→N,E→W)/(N→S,E→W)/(S→N,W→E) 四种组合。\n塔↔带接口速率(BELT_PORT_RATE, 件/秒/塔,双向往返均限速)在 config.py。带上只运材料(武器/工具不落带)。",
+  "belts": {
+    "belt": {
+      "name_cn": "传送带",
+      "base_cost": 30,
+      "speed": 1.5,
+      "capacity": 16,
+      "requires_tech": ["steam:sV13"],
+      "color": [150, 150, 165]
+    },
+    "splitter": {
+      "name_cn": "均分器",
+      "base_cost": 60,
+      "speed": 1.5,
+      "capacity": 16,
+      "requires_tech": ["steam:sV14"],
+      "color": [200, 165, 90]
+    },
+    "bridge": {
+      "name_cn": "立交桥",
+      "base_cost": 90,
+      "speed": 1.5,
+      "capacity": 16,
+      "requires_tech": ["steam:sV15"],
+      "color": [135, 155, 195]
+    }
+  }
+}

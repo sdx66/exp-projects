@@ -2,13 +2,17 @@
 rl_utils.py - raylib 6.x 辅助工具
 
 raylib 6.x 使用 cffi 绑定，结构体通过 tuple 直接传入（不解包）。
-结构体格式:
+结构体格式（标量布局，C 层期望）:
   Color:     (r, g, b, a)     - 0-255
   Vector2:   (x, y)           - float
   Vector3:   (x, y, z)        - float
   Rectangle: (x, y, w, h)     - float
-  Camera2D:  (ox, oy, tx, ty, rot, zoom)
-  Camera3D:  (px, py, pz, tx, ty, tz, ux, uy, uz, fovy, proj)
+  Camera2D:  ((ox, oy), (tx, ty), rot, zoom)
+  Camera3D:  ((px, py, pz), (tx, ty, tz), (ux, uy, uz), fovy, proj)
+
+注意：本模块 camera2d()/camera3d() 返回的是**嵌套元组**（Vector2/3 位置、
+目标、上向量各自成组，见 R7-P4）——与旧文档列的展平元组不同；传参时整组
+直接传入，不解包。
 
 关键：传入时不解包，直接传 tuple！
   ✓ rl.DrawRectangle(x, y, w, h, color(255,0,0))

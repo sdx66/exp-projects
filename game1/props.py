@@ -82,7 +82,7 @@ PROP_TYPES: dict = {
     "coal_vein": PropType(
         name="coal_vein", shape="ore_vein", color=COAL_ORE_COLOR,
         biomes=("mountain", "tundra"), spawn_chance=0.015,
-        harvest_material="iron_ore", harvest_amount=1,  # 煤矿也产铁（简化）
+        harvest_material="coal", harvest_amount=1,  # 煤矿产煤，与地下煤块一致
         min_size=0.6, max_size=0.8,
     ),
     "cactus": PropType(

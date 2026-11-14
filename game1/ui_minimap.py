@@ -7,15 +7,21 @@ ui_minimap.py - 小地图（倍程缩放）
 不触发区块加载，结果与真实地形逐格一致。烘焙时在高度场上跑
 marching squares 叠加等高线（海平面以上，每 N 根一条加粗主线），
 每根线沿线印 4×6 点阵海拔数字（标签按服务半径散布、跨线防重叠，
-白晕底衬）。地形不可变，同一倍程
-只烘焙一次；敌军路径只增不改（与 renderer._render_path_2d 同以
-条数为缓存键），新增时仅重做"像素拷贝 + 路径叠加 + 纹理上传"。
+白晕底衬）。地形像素不可变（挖掘不改小地图烘焙），同一倍程
+只烘焙一次；敌军路径会随地形编辑改形（不止新增，见 BUG-084），
+故叠加缓存键取 (seed, range, path_count, world_version)——条数覆盖
+新增、world_version 覆盖改形，变化时仅重做
+"像素拷贝 + 路径叠加 + 纹理上传"。
 
 倍程缩放：±128 / 256 / 512 / 1024 四档（ui_config.MINIMAP_LEVELS），
 按 max(相机距离, 最远非休眠刷怪点距离) 自动升降档，跨档才重烘焙。
 休眠刷怪点画 1px 暗灰（数量随探索增长也不糊图），唤醒点 3px 醒目；
 出界的唤醒点用"射线-矩形求交"画真方向边缘点。相机超出最大倍程
 时改为沿边缘滑动的方向箭头 + 距离数字，位置信息永远真实。
+相机指示与缩放需求半径均锚定**渲染眼位**（get_camera3d 最终结果，
+含地形避让/下潜推挤/开局下限）：原地旋转（右键拖拽 / Q·E）语义是
+眼位固定、target 绕眼位公转，锚眼位则指示点钉住不动、需求半径不振荡
+（不会在倍程临界距离处来回切换档位）；锚 cam.target 会绕圈甩动。
 """
 
 import math
@@ -39,11 +45,16 @@ from rl_utils import (color, draw_line, draw_rect, draw_rect_lines, rect,
 
 _WHITE = (255, 255, 255, 255)
 
-# 刷怪点唤醒态颜色（与 renderer._render_spawners_2d 保持一致）
+# 刷怪点状态颜色（与 renderer._render_spawners_2d/_render_spawners_3d
+# 的 mode_colors 保持一致：scouting/active 取 3D 底座色 alpha=200；
+# 休眠色取 renderer 的 dormant 值，覆盖 ui_config 中偏紫的旧值）。
 _SPAWNER_COLORS = {
-    "scouting": (255, 220, 0, 220),
-    "active": (255, 50, 50, 220),
+    "scouting": (255, 220, 0, 200),
+    "active": (255, 50, 50, 200),
 }
+# 休眠刷怪点：与 renderer 的 dormant (120,120,120,200) 对齐
+# （ui_config.MINIMAP_SPAWNER_DORMANT 的 (110,110,125,190) 已弃用）。
+_SPAWNER_DORMANT_COLOR = (120, 120, 120, 200)
 
 
 def _step_for(world_range):
@@ -122,17 +133,23 @@ def compute_surface_blocks(universe, size, world_range=None):
 
     # ─── 4. 群系掩码链（第 6 步，顺序一致） ───────────────
     biome_arr = np.full((size, size), "plains", dtype=object)
-    biome_arr[h < 0.004] = "ocean"
+    biome_arr[h < 0.005] = "ocean"
     biome_arr[(temp < -10.0) & (h >= 0.18)] = "snowy"
     biome_arr[(temp < 3.0) & (temp >= -10.0) & (h >= 0.18)] = "tundra"
     biome_arr[(altitude > config.MOUNTAIN_ALT_RATIO * height)
               & (h >= 0.18)] = "mountain"
     biome_arr[(temp > 25.0) & (moisture < 0.3) & (h >= 0.18)] = "desert"
     biome_arr[(temp > 20.0) & (moisture >= 0.3) & (h >= 0.18)] = "savanna"
-    biome_arr[(temp < 15.0) & (moisture > 0.5) & (h >= 0.18)] = "forest"
+    # 森林只覆盖温带低地（BUG-125）：加 temp>=3 下界 + 海拔上界，与
+    # chunk._generate / world._biome_and_block_pure 三处必须逐字一致。
+    biome_arr[(temp < 15.0) & (temp >= 3.0) & (moisture > 0.5) & (h >= 0.18)
+              & (altitude <= config.MOUNTAIN_ALT_RATIO * height)] = "forest"
 
     # ─── 5. 表面方块（第 7 步：群系映射 + 雪盖 + 低草变沙） ─
-    surface_y = np.floor(altitude).astype(np.int32)
+    # 饱和列（h 饱和到 1.0 → altitude==height）夹到最高有效格 height-1，
+    # 与 chunk._generate 的 surface_y 钳制（BUG-019）一致（BUG-116），
+    # 由此饱和列取群系表面方块（雪/石…），不再被涂成泥土。
+    surface_y = np.minimum(np.floor(altitude).astype(np.int32), height - 1)
     surface_blocks = np.zeros((size, size), dtype=np.uint8)
     for biome_name, block_id in BIOME_SURFACE_BLOCK.items():
         surface_blocks[biome_arr == biome_name] = block_id
@@ -141,12 +158,8 @@ def compute_surface_blocks(universe, size, world_range=None):
     low_grass = (h < 0.25) & (surface_blocks == BLOCK_ID["grass"])
     surface_blocks[low_grass] = BLOCK_ID["sand"]
 
-    # ─── 满高柱修正（复刻 chunk 填柱逻辑）──────────────────
-    # h 饱和到 1.0 时 surface_y == height 越界，col_pos==0 的表层方块
-    # 永远不会被放置，柱顶实际是 col_pos=-1 的泥土带（chunk._generate
-    # 第 9 步）。不修正的话此类种子会被雪盖误涂成全白。
-    surface_blocks[surface_y >= height] = BLOCK_ID["dirt"]
-
+    # 饱和列已由上方 surface_y 夹到 height-1 处理（BUG-116），取群系表面
+    # 方块，与 chunk._generate 的夹制（BUG-019）语义一致，不再涂成泥土。
     return surface_blocks, h, biome_arr
 
 
@@ -163,10 +176,12 @@ def compute_terrain_pixels(universe, size, world_range=None):
     for block_id in np.unique(surface_blocks):
         rgb[surface_blocks == block_id] = get_block(int(block_id)).top_color
 
-    # 高度明暗（山体立体感）；海洋改用深度明暗（海岸线可读）
+    # 高度明暗（山体立体感）；海洋改用深度明暗（海岸线可读）。
+    # 深度分母与海洋阈值同为 0.005（R3-I1：原 0.004 残留副本，与
+    # _generate 的 h<0.005 不一致）。
     shade = 1.0 + (h - 0.5) * 0.24
     ocean = biome_arr == "ocean"
-    depth = np.clip(h / 0.004, 0.0, 1.0)
+    depth = np.clip(h / 0.005, 0.0, 1.0)
     shade[ocean] = 0.55 + 0.45 * depth[ocean]
     rgb *= np.clip(shade, 0.55, 1.3)[:, :, None]
 
@@ -193,7 +208,7 @@ _MS_SEGMENTS = {
 
 def _overlay_contours(pixels, h, height, labels=True):
     """等高线叠加进地形像素。层级取 MINIMAP_CONTOUR_STEP 的等差序列，
-    海平面（h < 0.004 为海洋，与 chunk 同阈值）以上才画——海底保持
+    海平面（h < 0.005 为海洋，与 chunk 同阈值）以上才画——海底保持
     深度明暗；每 MINIMAP_CONTOUR_MAJOR_EVERY 根一条主线（加粗到 2px，
     与细线一眼可辨）。所有层级沿线烘焙海拔数字（按服务半径散布；
     height 为世界最大高度，标签值 = 层级 × height）。
@@ -210,7 +225,7 @@ def _overlay_contours(pixels, h, height, labels=True):
 
     major_entries = []  # (层级值, 线像素 rows, cols, 是否主线)，标签用
     n_levels = max(0, int(round(1.0 / step)))    # v < 1.0（饱和平台不画顶线）
-    k0 = max(1, math.ceil(0.004 / step - 1e-9))  # 跳过海平面以下层级
+    k0 = max(1, math.ceil(0.005 / step - 1e-9))  # 跳过海平面以下层级
     for k in range(k0, n_levels):
         v = k * step
         above = h >= v
@@ -445,7 +460,7 @@ class Minimap:
     def __init__(self, universe):
         self._tex = None
         self._terrain_pixels = None
-        self._baked_key = None      # (seed, range, path_count)
+        self._baked_key = None      # (seed, range, path_count, world_version)
         # 地形像素缓存：地形只由 seed+倍程决定（挖掘不改小地图烘焙），
         # 四档倍程首次访问后复用，避免每次跨档重跑 50-70ms 的噪声烘焙。
         self._terrain_cache = OrderedDict()
@@ -459,6 +474,18 @@ class Minimap:
         self._compute_terrain(universe)
 
     # ─── 烘焙 ────────────────────────────────────────────
+
+    def _path_count(self, game, universe):
+        """实际会被叠加绘制的路径条数（新刷怪点激活/变体生成时递增）。
+
+        _ensure_path 新增路径并不递增 world_version，故烘焙缓存键若只含
+        world_version，则新激活刷怪点的路径不会触发重烘焙，直到塔放置/
+        挖掘/变焦等无关事件。用路径条数作为键的第三元即可覆盖新增。
+        """
+        pf = getattr(game, "pathfinder", None) if game is not None else None
+        if pf is not None:
+            return len(pf.render_paths())
+        return len(universe.enemy_paths)
 
     def _compute_terrain(self, universe, game=None):
         """按当前倍程取地形像素；首次烘焙后按 (seed, range) 缓存复用。"""
@@ -478,7 +505,9 @@ class Minimap:
         else:
             self._terrain_cache.move_to_end(key)
         self._terrain_pixels = pixels
-        self._baked_key = (universe.seed, self.range, universe.world_version)
+        self._baked_key = (universe.seed, self.range,
+                           self._path_count(game, universe),
+                           universe.world_version)
         self._upload(universe, game)
 
     def _upload(self, universe, game=None):
@@ -504,20 +533,28 @@ class Minimap:
             self._tex = None
 
     def _overlay_paths(self, pixels, universe, game=None):
-        """敌军路径叠加进像素数组（半透明暗黄，仿 renderer._render_path_2d）。
+        """敌军路径叠加进像素数组（半透明，色与 renderer._path_color_for
+        同口径：tan(180,160,120) × 敌人类型色 50% 混合）。
 
         有寻路管理器时只画各 (刷怪点×类型) 的主变体（idx=0）。
         """
-        pr, pg, pb, pa = uc.MINIMAP_PATH_COLOR
-        a = pa / 255.0
+        a = uc.MINIMAP_PATH_ALPHA / 255.0
         tex_px = uc.MINIMAP_TEX_PX
         pf = getattr(game, "pathfinder", None) if game is not None else None
         if pf is not None:
-            paths = [pd for (_sid, _tn, idx), pd in pf.render_paths().items()
-                     if idx == 0]
+            items = [(key, pd) for key, pd in pf.render_paths().items()
+                     if key[2] == 0]
         else:
-            paths = list(universe.enemy_paths.values())
-        for path_data in paths:
+            items = [(("unknown", getattr(pd, "type_name", "regular"), 0), pd)
+                     for pd in universe.enemy_paths.values()]
+        # R1-A4：与 renderer._path_color_for 完全一致（tan 基色 + 类型色
+        # 50% 混合），同一路线两视图颜色一致——原来固定 (255,200,50) 与
+        # renderer 的类型混合色不一致。
+        _TAN = (180, 160, 120)
+        for (key, path_data) in items:
+            _base = gamedata.ENEMY_COLORS.get(key[1], (200, 50, 50))
+            pr, pg, pb = (int(_t * 0.5 + _b * 0.5)
+                          for _t, _b in zip(_TAN, _base))
             for x, _y, z in path_data.points:
                 # 路径点是世界坐标（方块中心）→ 采样像素
                 px = int((x - self._origin_x) // self._step)
@@ -533,13 +570,24 @@ class Minimap:
 
     # ─── 倍程管理 ────────────────────────────────────────
 
-    def _raw_need_radius(self, game):
-        """缩放需求半径（格）：相机与大本营距离、最远非休眠刷怪点距离的较大者"""
-        cam = game.camera
+    def _cam_xz(self, cam):
+        """相机锚点世界 XZ（缩放需求半径与相机指示共用）。
+
+        2D：相机位置 pos_2d。
+        3D：**渲染眼位**（get_camera3d 的最终结果，含地形避让/下潜推挤/
+        开局下限）——原地旋转（右键拖拽 / Q·E）语义是"眼位固定、视线方向
+        绕相机旋转"，眼位不动、target 绕眼位公转；若锚在 cam.target，原地
+        旋转时指示点会绕圈甩动、需求半径振荡导致倍程来回切换。
+        """
         if cam.is_2d():
-            cx, cz = cam.pos_2d[0], cam.pos_2d[2]
-        else:
-            cx, cz = cam.target[0], cam.target[2]
+            return cam.pos_2d[0], cam.pos_2d[2]
+        eye = cam.get_camera3d()[0]
+        return eye[0], eye[2]
+
+    def _raw_need_radius(self, game):
+        """缩放需求半径（格）：相机锚点与大本营距离、最远非休眠刷怪点距离的较大者"""
+        cam = game.camera
+        cx, cz = self._cam_xz(cam)
         bx = game.universe.base_x
         bz = game.universe.base_z
         need = math.hypot(cx - bx, cz - bz)
@@ -555,18 +603,22 @@ class Minimap:
         return need
 
     def _update_level(self, game):
-        """每帧：按需求半径升降倍程，跨档重烘焙；世界版本变化只重上传路径。"""
+        """每帧：按需求半径升降倍程，跨档重烘焙；路径条数或世界版本变化
+        （地形编辑触发重寻路，改形或新增）时重上传路径叠加。"""
         self._need_raw = self._raw_need_radius(game)
         level = pick_level(self._need_raw, self.range)
         range_changed = level != self.range
         if range_changed:
             self.range = level
         universe = game.universe
-        version = universe.world_version
+        path_count = self._path_count(game, universe)
         if range_changed or universe.seed != self._baked_key[0]:
             self._compute_terrain(universe, game)
-        elif version != self._baked_key[2]:
-            self._baked_key = (universe.seed, self.range, version)
+        elif (path_count != self._baked_key[2]
+              or universe.world_version != self._baked_key[3]):
+            # world_version 覆盖"改形不换数"的地形编辑重寻路（BUG-084）
+            self._baked_key = (universe.seed, self.range, path_count,
+                               universe.world_version)
             self._upload(universe, game)
 
     # ─── 布局与坐标 ──────────────────────────────────────
@@ -701,18 +753,16 @@ class Minimap:
                              else uc.MINIMAP_EDGE_DOT_SCOUTING)
                         draw_rect(ex - 1, ey - 1, 2, 2, color(*c))
             elif in_map(x, y):
-                draw_rect(x, y, 1, 1, color(*uc.MINIMAP_SPAWNER_DORMANT))
+                draw_rect(x, y, 1, 1, color(*_SPAWNER_DORMANT_COLOR))
 
         # 相机指示：图内画十字/视野框；图外画边缘方向箭头 + 距离
         cam = game.camera
+        cx, cz = self._cam_xz(cam)
         if cam.is_2d():
-            cx, cz = cam.pos_2d[0], cam.pos_2d[2]
             half_w = rl.GetScreenWidth() / (2 * cam.zoom_2d)
             half_h = rl.GetScreenHeight() / (2 * cam.zoom_2d)
             x0, y0 = to_mm(cx - half_w, cz - half_h)
             x1, y1 = to_mm(cx + half_w, cz + half_h)
-        else:
-            cx, cz = cam.target[0], cam.target[2]
         cam_dist = math.hypot(cx - universe.base_x, cz - universe.base_z)
         tx, ty = to_mm(cx, cz)
         if in_map(tx, ty):
@@ -721,7 +771,10 @@ class Minimap:
                 draw_rect_lines(rect(x0, y0, x1 - x0, y1 - y0), 1,
                                 color(*uc.MINIMAP_CAMERA_COLOR))
             else:
-                # 3D：target 十字 + 按 distance 缩放的示意框
+                # 3D：**渲染眼位**十字 + 按 distance 缩放的示意框。
+                # 原地旋转（右键拖拽 / Q·E）语义是眼位固定、target 绕眼位
+                # 公转——锚点必须用眼位（_cam_xz），勿回退 cam.target，否则
+                # 指示点会绕圈甩动（用户所见"点来回转"）。
                 r = max(4.0, min(size // 5, cam.distance * 0.3))
                 c = color(*uc.MINIMAP_CAMERA_3D_COLOR)
                 draw_line(tx - r, ty, tx + r, ty, c)
@@ -794,6 +847,16 @@ class Minimap:
         if cam.is_2d():
             cam.pos_2d = (wx, 0, wz)
         else:
-            wy = game.universe.get_surface_height_smooth_safe(wx, wz) + 1
+            # R1-A5：未加载区块 get_surface_height_smooth_safe 返回默认 5.0，
+            # 初始倍程 128 可点远处未加载区 → target 锁死 y≈6、视线垂直错位
+            # 不自校正。已加载区块保持平滑插值；未加载改用纯噪声+覆盖层查询
+            # （不触发生成、与烘焙同源），始终精确。
+            u = game.universe
+            _cx = int(wx // config.CHUNK_SIZE)
+            _cz = int(wz // config.CHUNK_SIZE)
+            if u.get_chunk_safe(_cx, _cz) is not None:
+                wy = u.get_surface_height_smooth_safe(wx, wz) + 1
+            else:
+                wy = u.get_surface_top_over_footprint_pure(wx, wz, 0.0) + 1.0
             cam.target = (wx, wy, wz)
         return True

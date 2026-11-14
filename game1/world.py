@@ -74,6 +74,24 @@ class WeatherState:
 
 # ─── 宇宙 ──────────────────────────────────────────────────
 
+def stand_y_scan(solid_at, x: int, z: int, hit_y: float, y_cap: int) -> int:
+    """命中点 → 可站立层 Y（方块扫描，Universe.stand_y_for_hit 与无头测试共用）。
+
+    solid_at(x, y, z) -> bool（True=实心）。命中层起向上爬到第一个空气
+    下方：普通地表=列顶+1；洞底命中=洞底+1；侧脸命中（上方仍实心）
+    爬到柱顶。命中点恰落在方块顶面平面的浮点巧合时 floor 会给出上面的
+    空气层，若本层非实心而下一层实心则吸附回命中方块。
+    """
+    y = int(math.floor(hit_y))
+    if y < 0:
+        y = 0
+    if not solid_at(x, y, z) and y > 0 and solid_at(x, y - 1, z):
+        y -= 1
+    while y < y_cap and solid_at(x, y + 1, z):
+        y += 1
+    return y + 1
+
+
 class Universe:
     """
     种子驱动的无限宇宙。
@@ -91,7 +109,10 @@ class Universe:
         self.rng = random.Random(seed)
 
         # 宇宙参数（由种子决定）
-        self.base_temperature = 10.0 + self.rng.uniform(-5.0, 15.0)
+        # 基准温度：原 [-5,15) 加成使 base_temperature<25，而 temp≤base_temperature
+        # 恒成立，desert 阈值 temp>25 永不可达（BUG-006）。上限抬到 35 使
+        # 低地（altitude→0, temp→base）可跨过 25，沙漠群系得以生成。
+        self.base_temperature = 10.0 + self.rng.uniform(-5.0, 35.0)
         self.moisture_base = self.rng.uniform(0.3, 0.7)
 
         # 大本营位置（世界原点）
@@ -174,6 +195,9 @@ class Universe:
         self._loaded_chunk_count += 1
         # 重放该区块的地形编辑（挖掘痕迹在区块 LRU 淘汰重生成后不丢失）
         self._replay_chunk_edits(chunk)
+        # 材料化该区块覆盖的粗格刷怪点（先于道具散布：刷怪点路径计入
+        # _path_cells，道具才不会刷在敌人路线上）
+        self._materialize_chunk_spawners(cx, cz)
         # 生成道具
         props = self._scatter_props_for_chunk(cx, cz)
         # 聚合道具到全局列表
@@ -182,8 +206,6 @@ class Universe:
             if not prop.harvested and cell_key not in self._harvested_cells:
                 self.props.add(cell_key)
                 self.props_by_cell[cell_key] = prop
-        # 材料化该区块覆盖的粗格刷怪点
-        self._materialize_chunk_spawners(cx, cz)
         return chunk
 
     def set_chunk_limit(self, limit: int):
@@ -274,7 +296,7 @@ class Universe:
 
     def _replay_chunk_edits(self, chunk: Chunk) -> None:
         """区块生成/重生成后，重放落入其范围的挖掘/放置编辑。"""
-        # _edits_by_chunk 以区块索引 (cx, cz) 为键（见 dig_surface/break_block/
+        # _edits_by_chunk 以区块索引 (cx, cz) 为键（见 dig_front_block/break_block/
         # place_block），故这里用 chunk.cx/chunk.cz 而非世界原点 gx/gz 查询。
         edits = self._edits_by_chunk.get((chunk.cx, chunk.cz))
         if not edits:
@@ -305,6 +327,54 @@ class Universe:
             if ov is not None:
                 return ov
         return self._surface_height_pure(x, z)
+
+    def spawn_y_at(self, x: float, z: float) -> float:
+        """世界坐标处的地面出生/站立 Y（列顶 + 1，覆盖层感知）。"""
+        return float(self.surface_height_at(
+            math.floor(x), math.floor(z)) + 1)
+
+    def spawn_point_for(self, path) -> tuple:
+        """路径起点的出生坐标：XZ 取路径起点，Y 取真实列顶。
+
+        路径点 Y 来自平滑阶段的双线性插值，跨越高差时可能比真实地表
+        低/高数格；直接当出生 Y 会让敌人从地下爬出或从空中掉落。
+        """
+        points = getattr(path, "points", path)
+        p = points[0]
+        return (p[0], self.spawn_y_at(p[0], p[2]), p[2])
+
+    _NON_SOLID_BLOCK_IDS = None  # 已由 blocks.is_solid 取代，保留位以示教训
+
+    def ray_block_solid(self, x: int, y: int, z: int):
+        """射线拾取用方块实心查询：已加载区块返回 bool，未加载返回 None。
+
+        实心判定复用 blocks.is_solid（空气/水/岩浆不实心——射线穿过水面
+        命中海底，与列顶模型一致）。未加载区块返回 None，调用方（相机
+        拾取）退化为列顶判定——surface_height_at 永远可得，不会引入假平面。
+        """
+        if y < 0:
+            return True  # 基岩以下
+        cs = config.CHUNK_SIZE
+        cx = x // cs
+        cz = z // cs
+        chunk = self.chunks.get((cx, cz))
+        if chunk is None:
+            return None
+        return is_solid(chunk.get_block(x - cx * cs, y, z - cz * cs))
+
+    def stand_y_for_hit(self, x: int, z: int, hit_y: float) -> int:
+        """点击命中处的可站立地表 Y（放置与预览共用，与方块级拾取同模型）。
+
+        - 普通地表命中 = 列顶+1（与 surface_height_at+1 一致）；
+        - 拱洞/洞穴内地板命中 = 洞底+1（塔能放进通道堵路）；
+        - 命中侧脸（同列上方仍实心）= 爬到柱顶（塔立在崖顶而非嵌进崖体）；
+        - 区块未加载（拾取走列顶兜底）= 列顶+1。
+        """
+        cs = config.CHUNK_SIZE
+        if self.chunks.get((x // cs, z // cs)) is None:
+            return self.surface_height_at(x, z) + 1
+        return stand_y_scan(self.ray_block_solid, x, z, hit_y,
+                            config.WORLD_HEIGHT)
 
     def surface_height_footprint(self, x: float, z: float, r: float = 0.2) -> int:
         """足迹覆盖列的地表最大值（覆盖层感知），供敌人 Y 锚定。"""
@@ -344,24 +414,82 @@ class Universe:
                         dirty.add((cx + dx, cz + dz))
         self.dirty_chunks.update(dirty)
 
-    def dig_front_block(self, x: int, y: int, z: int) -> bool:
-        """削掉 (x, z) 柱上高度 y 的方块（任意高度，敌人掘进自下而上用）。
+    def dig_forbidden_at(self, x: int, z: int) -> bool:
+        """该位置是否禁止挖掘（dig_front_block 与挖掘会话触发共用）。
 
+        唯一守卫：大本营 5×5 放置禁区（与 _is_valid_placement 同框）正下方
+        任何深度不可挖——防止敌人紧挨大本营钻出来。其余位置挖掘完全不受限
+        （含基座环：敌人可用"挖台阶"逐级爬上环/山坡，见 _update_dig 的
+        盘山路语义，BUG-104）。
+        """
+        return abs(x - self.base_x) <= 2 and abs(z - self.base_z) <= 2
+
+    # ─── 大本营平台挖掘守卫（D2：防"挖低平台边缘后回不去"）──────
+
+    def base_platform_height(self) -> int:
+        """大本营平台高度（挖掘守卫的基准面）。
+
+        与 Game.base_y 同口径取纯噪声列顶：5×5 禁挖区保证该列不会被
+        挖掘改写，故可安全地作为常量基准。
+        """
+        h = getattr(self, "_base_platform_h", None)
+        if h is None:
+            h = self._surface_height_pure(self.base_x, self.base_z)
+            self._base_platform_h = h
+        return h
+
+    def enemy_dig_floor(self, x: int, z: int):
+        """平台区敌挖列顶下限；None 表示该列不受守卫限制。
+
+        平台 = 半径 BASE_DIG_GUARD_RADIUS（= BASE_RADIUS+3，与 chunk 平整圆盘
+        同半径）的圆盘。敌人挖平台列时会产生"站位+1"的台阶，若台阶低于
+        平台高度-1，回环需要爬 >climb_pass 且平台内 5×5 禁挖 → 永久卡死。
+        """
+        if math.hypot(x - self.base_x, z - self.base_z) >= config.BASE_DIG_GUARD_RADIUS:
+            return None
+        return self.base_platform_height() - config.BASE_DIG_GUARD_FLOOR
+
+    def enemy_dig_refused(self, x: int, z: int, passage_y) -> bool:
+        """敌人在 (x, z) 列开挖是否会破坏回环台阶（D2 守卫）。
+
+        passage_y = 本次挖掘将标记的通行高度（_update_dig 的
+        mark_passage(target, base+1)，即调用方传入 base+1）。平台区内若
+        该高度低于 平台高度-1，开挖即会把自己锁在平台边缘回不去（实测
+        seed3091 (-36,0) regular 停在 (-3,-1)、seed79 悬崖 tank 停在
+        (0,3)）→ 拒绝并要求改道。
+        规划层（pathfinding.astar 的 dig_floor 数组，检查 ch+1 < floor）
+        与本函数必须同源：那里 ch+1 即此处的 passage_y。
+        """
+        floor = self.enemy_dig_floor(x, z)
+        if floor is None:
+            return False
+        return passage_y < floor
+
+    def dig_block_id(self, x: int, y: int, z: int) -> int:
+        """削掉 (x, z) 柱上高度 y 的方块（任意高度），返回被挖掉的方块 ID。
+
+        0 表示未挖（陆地/大本营/基岩/空气/水/岩浆守卫不通过）。这是玩家开采塔
+        竖井逐块向下采的入口；敌人掘进（dig_front_block）与玩家挖掘
+        （break_block）复用同一实现。
         柱面模型：只削方块、不做隧道；海洋柱不挖（不模拟水位）；基岩不挖。
         若削到的是当前列顶（y == surface_height_at），则向下扫描求新的最高
         实体方块作为列顶并更新 surface_override；内部掏洞不改列顶。
         不在此处推进 world_version：挖掘逐格连续（一次会话几十格），逐格
         bump 会让全体变体缓存失效、小地图重烘焙，敌人路线反复横跳；会话
-        结束由调用方（entities._update_dig）统一 bump_world_version。
+        结束由调用方（entities._update_dig / 开采塔）统一 bump_world_version。
         渲染仍逐格标脏 dirty_chunks，视觉实时。
         """
         if not self._is_land_pure(x, z):
-            return False
+            return 0
+        if self.dig_forbidden_at(x, z):
+            # 大本营 5×5 放置禁区：任何深度不可挖，见 dig_forbidden_at
+            return 0
         if y < 2:
-            return False  # 基岩不可挖
-        if self.get_block(x, y, z) in (BLOCK_ID["air"], BLOCK_ID["water"],
-                                       BLOCK_ID["lava"], BLOCK_ID["bedrock"]):
-            return False
+            return 0  # 基岩不可挖
+        block_id = self.get_block(x, y, z)
+        if block_id in (BLOCK_ID["air"], BLOCK_ID["water"],
+                        BLOCK_ID["lava"], BLOCK_ID["bedrock"]):
+            return 0
         self.block_edits[(x, y, z)] = BLOCK_ID["air"]
         cs = config.CHUNK_SIZE
         cx = x // cs
@@ -376,42 +504,59 @@ class Universe:
         # 内部掏洞（y < 列顶）不影响列顶，surface_override 保持权威。
         if y == self.surface_height_at(x, z):
             new_y = y - 1
-            while new_y >= 2 and self.get_block(x, new_y, z) in (
+            # 扫描到 y>=1：y=1 是基岩之上的实心泥土顶（不可挖，恒存在），
+            # 可作为列顶；原兜底把列顶钉在 y=2（刚挖开的空气格）（BUG-095）。
+            while new_y >= 1 and self.get_block(x, new_y, z) in (
                     BLOCK_ID["air"], BLOCK_ID["water"], BLOCK_ID["lava"]):
                 new_y -= 1
-            if new_y < 2:
-                new_y = 2  # 基岩面兜底（基岩不可挖，列顶不低于 2）
+            if new_y < 1:
+                new_y = 1  # 基岩面兜底（基岩不可挖，列顶不低于 1）
             self.surface_override[(x, z)] = new_y
+            # 注意：上面的 get_block 可能触发懒加载（区块原本未载入时
+            # chunk 仍是 None）。重取一次，保证刚载入的区块列顶也被修正，
+            # 否则其 surface_height 停留在挖掘前的噪声值（BUG-114）。
+            chunk = self.chunks.get((cx, cz))
             if chunk is not None:
                 lx = x - cx * cs
                 lz = z - cz * cs
                 if chunk.surface_height[lx][lz] >= y:
                     chunk.surface_height[lx][lz] = new_y
         self._mark_chunks_dirty(x, z)
-        return True
+        return block_id
 
-    def dig_surface(self, x: int, z: int) -> bool:
-        """挖掉 (x, z) 柱的地表方块（削低 1 格）。返回是否实际挖掘。
+    def dig_front_block(self, x: int, y: int, z: int) -> bool:
+        """削掉 (x, z) 柱上高度 y 的方块（任意高度，敌人掘进自下而上用）。
 
-        柱面模型：只削地表、不做隧道；海洋柱不挖（不模拟水位）。
-        不在此处推进 world_version：挖掘是逐格连续的（一次会话几十格），
-        逐格 bump 会让全体变体缓存失效、小地图重烘焙，敌人路线反复横跳。
-        会话结束由调用方（entities._update_dig）统一 bump_world_version。
+        柱面模型：只削方块、不做隧道；海洋柱不挖（不模拟水位）；基岩不挖。
+        若削到的是当前列顶（y == surface_height_at），则向下扫描求新的最高
+        实体方块作为列顶并更新 surface_override；内部掏洞不改列顶。
+        不在此处推进 world_version：挖掘逐格连续（一次会话几十格），逐格
+        bump 会让全体变体缓存失效、小地图重烘焙，敌人路线反复横跳；会话
+        结束由调用方（entities._update_dig）统一 bump_world_version。
         渲染仍逐格标脏 dirty_chunks，视觉实时。
-
-        现为 dig_front_block 的列顶薄封装（削当前列顶那一块 = 等价削顶 1 格）。
         """
-        return self.dig_front_block(x, self.surface_height_at(x, z), z)
+        return self.dig_block_id(x, y, z) != 0
 
-    def mark_passage(self, x: int, z: int, y: int) -> None:
-        """把 (x, z) 列的通行高度标记为 y（打通通道用）。
+    def mark_passage(self, x: int, z: int, y: int) -> bool:
+        """把 (x, z) 列的通行高度标记为 y（打通通道用），返回是否实际改动。
 
         与 dig_front_block 挖掉 Front/Above 配合：敌人"开洞"后，该列实体方块
         可能仍悬在 y+2 以上（拱门视觉），但通行/锚定按 y 处理。写 surface_override
         并标脏 chunk 触发 mesh 重建（暴露面由 6 面邻接掩码自动呈现）。
-        不 bump world_version：会话结束由调用方统一 bump。
+        不在此处推进 world_version：会话结束由调用方统一 bump——但调用方必须在
+        "passage 实际被改低"时也 bump（BUG-103：只削空腔、不削块的会话同样改变
+        通行高度，若漏 bump 寻路缓存不会失效，敌人会一直拿到过期路径就地断路）。
+
+        只降不升：同列可能已有别处会话挖出的更深通道（override 更低）。
+        若被更高基准的会话抬高列顶，敌人锚定会跳进未挖开的实心里
+        （瞬间穿方块弹起——"敌人从地里冒出来"）。与下方 chunk.surface_height
+        的 only-lower 语义保持一致。
         """
-        self.surface_override[(x, z)] = y
+        changed = False
+        cur = self.surface_override.get((x, z))
+        if cur is None or y < cur:
+            self.surface_override[(x, z)] = y
+            changed = True
         cs = config.CHUNK_SIZE
         cx = x // cs
         cz = z // cs
@@ -421,46 +566,38 @@ class Universe:
             lz = z - cz * cs
             if chunk.surface_height[lx][lz] > y:
                 chunk.surface_height[lx][lz] = y
+                changed = True
         self._mark_chunks_dirty(x, z)
+        return changed
 
-    # ─── 玩家挖/放方块 API（柱面模型：作用于列顶） ──────────
+    # ─── 玩家挖/放方块 API ────────────────────────────────
 
     def top_block_id(self, x: int, z: int) -> int:
         """列顶方块 ID（覆盖层感知，点击处区块必然已加载）。"""
         y = self.surface_height_at(x, z)
         return self.get_block(x, y, z)
 
-    def break_block(self, x: int, z: int) -> int:
-        """玩家挖掉 (x, z) 列顶方块（削低 1 格）。返回被挖掉的方块 ID，
-        0 表示未挖（海洋/基岩/不可挖方块）。
+    def break_block(self, x: int, z: int, y: int | None = None) -> int:
+        """玩家挖掉方块，返回被挖掉的方块 ID，0 表示未挖。
 
-        与 dig_surface 同一柱面模型，但返回方块 ID 供上层映射材料；
+        y=None：旧柱面语义，挖 (x, z) 的通行列顶（2D 视图无高度信息）。
+        y 给定：挖射线命中的那一格（3D 挖掘），可挖侧面/拱洞悬垂/洞底；
+        交给 dig_front_block 记账——只有该格正好是当前通行列顶时才降低
+        surface_override，挖悬垂/侧壁不会改变敌人通行高度。
+
         世界版本由调用方批量 bump（见 game._try_dig_block）。
         """
         if not self._is_land_pure(x, z):
             return 0
-        cur = self.surface_height_at(x, z)
+        cur = self.surface_height_at(x, z) if y is None else int(y)
         if cur <= 1:
             return 0  # 基岩不可挖
         top_id = self.get_block(x, cur, z)
         if top_id in (BLOCK_ID["air"], BLOCK_ID["water"],
                       BLOCK_ID["lava"], BLOCK_ID["bedrock"]):
             return 0
-        new_y = cur - 1
-        self.surface_override[(x, z)] = new_y
-        self.block_edits[(x, cur, z)] = BLOCK_ID["air"]
-        cs = config.CHUNK_SIZE
-        cx = x // cs
-        cz = z // cs
-        self._edits_by_chunk.setdefault((cx, cz), set()).add((x, cur, z))
-        chunk = self.chunks.get((cx, cz))
-        if chunk is not None:
-            lx = x - cx * cs
-            lz = z - cz * cs
-            chunk.set_block(lx, cur, lz, BLOCK_ID["air"])
-            if chunk.surface_height[lx][lz] >= cur:
-                chunk.surface_height[lx][lz] = new_y
-        self._mark_chunks_dirty(x, z)
+        if not self.dig_front_block(x, cur, z):
+            return 0
         return top_id
 
     def place_block(self, x: int, z: int, block_id: int) -> bool:
@@ -522,8 +659,10 @@ class Universe:
     def get_surface_height_smooth(self, x: float, z: float) -> float:
         cx = math.floor(x) // config.CHUNK_SIZE
         cz = math.floor(z) // config.CHUNK_SIZE
-        lx = math.floor(x) - cx * config.CHUNK_SIZE
-        lz = math.floor(z) - cz * config.CHUNK_SIZE
+        # 传小数世界本地坐标（x - 原点），区块内双线性插值的 tfx/tfz 才非 0；
+        # 原实现传 floor 后的整数，插值退化成整格高度（BUG-096）。
+        lx = x - cx * config.CHUNK_SIZE
+        lz = z - cz * config.CHUNK_SIZE
         chunk = self.get_chunk(cx, cz)
         return chunk.get_surface_height_smooth(lx, lz)
 
@@ -553,47 +692,17 @@ class Universe:
             return 0
         return chunk.get_block(x - cx * cs, y, z - cz * cs)
 
-    def get_surface_height_safe(self, x: int, z: int) -> int:
-        """获取表面高度，不触发生成。未加载返回默认值。"""
-        cs = config.CHUNK_SIZE
-        cx = x // cs
-        cz = z // cs
-        chunk = self.chunks.get((cx, cz))
-        if chunk is None:
-            return 5  # 默认平原高度
-        return chunk.get_surface_height(x - cx * cs, z - cz * cs)
-
     def get_surface_height_smooth_safe(self, x: float, z: float) -> float:
         """获取平滑表面高度，不触发生成。"""
         cx = math.floor(x) // config.CHUNK_SIZE
         cz = math.floor(z) // config.CHUNK_SIZE
-        lx = math.floor(x) - cx * config.CHUNK_SIZE
-        lz = math.floor(z) - cz * config.CHUNK_SIZE
+        # 同 BUG-096：传小数本地坐标，保留 x/z 的小数部分供双线性插值。
+        lx = x - cx * config.CHUNK_SIZE
+        lz = z - cz * config.CHUNK_SIZE
         chunk = self.get_chunk_safe(cx, cz)
         if chunk is None:
             return 5.0
         return chunk.get_surface_height_smooth(lx, lz)
-
-    def get_surface_top_over_footprint(self, x: float, z: float, r: float = 0.5) -> int:
-        """返回敌人足迹（以 (x,z) 为中心、边长 ~2r 的方形）覆盖到的所有格
-        表面高度的最大值。
-
-        用途：敌人 Y 锚定。取足迹覆盖的最高列顶，可保证敌人底面 (Y-1) 永不
-        低于其覆盖的任何实体方块顶部，从而不再切入山体/崖壁（原双线性插值
-        在陡崖处会给出低于相邻高列顶的中间值，导致敌人穿入实体方块）。
-        未加载区块沿用 get_surface_height_safe 的默认值 5，不触发生成。
-        """
-        ix0 = math.floor(x - r)
-        ix1 = math.floor(x + r)
-        iz0 = math.floor(z - r)
-        iz1 = math.floor(z + r)
-        top = 0
-        for ix in range(ix0, ix1 + 1):
-            for iz in range(iz0, iz1 + 1):
-                h = self.get_surface_height_safe(ix, iz)
-                if h > top:
-                    top = h
-        return top
 
     def get_surface_top_over_footprint_pure(self, x: float, z: float,
                                             r: float = 0.5) -> int:
@@ -655,16 +764,24 @@ class Universe:
     def _surface_height_pure(self, x: int, z: int) -> int:
         """纯噪声地表高度（与 chunk.get_surface_height 完全一致，不加载区块）。"""
         h = self._get_height_with_base_override(x, z)
-        return int(h * self.height)
+        # 夹到最高有效格 height-1：h 饱和到 1.0 时 int(h*height)==height 越界，
+        # 而 chunk._generate 已把 surface_y 夹到 height-1（BUG-019），否则纯查询
+        # 比渲染列顶高 1 格（BUG-113）。max(0,…) 兜底防负高度。
+        return max(0, min(int(h * self.height), self.height - 1))
 
     def _is_land_pure(self, x: int, z: int) -> bool:
-        """纯噪声陆地判定（与 chunk ocean 阈值 h<0.20 一致，不加载区块）。"""
-        return self._get_height_with_base_override(x, z) >= 0.20
+        """纯噪声陆地判定（与 chunk 海洋列阈值 h<0.005 一致，不加载区块）。
+
+        旧值 h>=0.20 已废弃（chunk.py 注释明言 0.20 是废弃值），沿岸
+        [0.005, 0.20) 的格渲染为陆地却不能被挖/放塔/刷怪，故对齐到 0.005。
+        """
+        return self._get_height_with_base_override(x, z) >= 0.005
 
     def _biome_pure(self, x: int, z: int) -> str:
         """纯噪声群系判定（镜像 chunk._generate 的掩码链，不加载区块）。
 
-        后写的掩码覆盖先写的（森林可覆盖雪山/山地），逐级 if 复刻该语义。
+        后写的掩码覆盖先写的；森林带 temp/海拔界限（BUG-125），不再覆盖
+        雪山/苔原/山地，逐级 if 复刻该语义。
         """
         key = (x, z)
         cached = self._biome_cache.get(key)
@@ -698,7 +815,9 @@ class Universe:
                                      m_cfg["levels"])
         # 群系：与 chunk._generate 掩码覆盖顺序一致（后者覆盖前者）
         biome = None
-        if h < 0.004:
+        # 海洋阈值 h<0.005 与 chunk._generate / _is_land_pure 一致，
+        # 否则 [0.004,0.005) 沿岸格群系判为 plains 而渲染是海水（BUG-097）。
+        if h < 0.005:
             biome = "ocean"
         if temp < -10.0 and h >= 0.18:
             biome = "snowy"
@@ -710,7 +829,11 @@ class Universe:
             biome = "desert"
         if temp > 20.0 and moisture >= 0.3 and h >= 0.18:
             biome = "savanna"
-        if temp < 15.0 and moisture > 0.5 and h >= 0.18:
+        # 森林只覆盖温带低地（BUG-125）：原仅 temp<15，是 snowy/tundra 的超集，
+        # 会把高湿度的雪原/苔原/山地覆盖成森林。加 temp>=3 下界 + 海拔上界，
+        # 与 chunk._generate / ui_minimap.compute_surface_blocks 完全一致。
+        if (temp < 15.0 and temp >= 3.0 and moisture > 0.5 and h >= 0.18
+                and altitude <= config.MOUNTAIN_ALT_RATIO * self.height):
             biome = "forest"
         if biome is None:
             biome = "plains"
@@ -735,8 +858,14 @@ class Universe:
 
     @staticmethod
     def _spawner_id_for(gx: int, gz: int) -> int:
-        """粗格坐标 → 确定性刷怪点 id（稳定、与材料化顺序无关）。"""
-        return (gx + 32768) * 65536 + (gz + 32768)
+        """粗格坐标 → 确定性刷怪点 id（稳定、与材料化顺序无关）。
+
+        两个 16 位定宽字段 (gx&0xFFFF)<<16 | (gz&0xFFFF)：原 base-65536 编码
+        (gx+32768)*65536+(gz+32768) 的低位 (gz+32768) 会溢出到高位，使
+        |gz|>=32768 的相异粗格碰撞、刷怪点被静默丢弃（BUG-098）；定宽掩码对
+        任意 65536×65536 窗口单射，远超可达网格。
+        """
+        return ((gx & 0xFFFF) << 16) | (gz & 0xFFFF)
 
     def _spawner_roll(self, gx: int, gz: int) -> bool:
         """粗格 (gx,gz) 是否产生刷怪点。纯函数，与扫描顺序无关。
@@ -779,7 +908,10 @@ class Universe:
         # 保险：确保落在可站立陆地（中心格已验证，但再保险一次）
         if not self._is_land_pure(sx, sz):
             return False
-        surface_y = self._surface_height_pure(sx, sz)
+        # 列顶用统一地表查询入口（覆盖层感知），随挖掘/垫高更新；
+        # 原取纯噪声快照 _surface_height_pure，挖低刷怪点下方后侦察怪/标记
+        # 的 Y 会陈旧（BUG-099）。
+        surface_y = self.surface_height_at(sx, sz)
         # biome 从 chunk 取（材料化时 chunk 已加载），若未加载则用 "plains"
         chunk_key = (sx // config.CHUNK_SIZE, sz // config.CHUNK_SIZE)
         chunk = self.chunks.get(chunk_key)
@@ -788,7 +920,11 @@ class Universe:
             lz = sz - chunk_key[1] * config.CHUNK_SIZE
             biome = chunk.get_biome(lx, lz)
         else:
-            biome = "plains"
+            # chunk 未加载（Universe.__init__ 材料化基地刷怪点时 chunks 为空、
+            # 存档重材料化远处 dormant 刷怪点）时用纯噪声群系查询兜底，
+            # 而非硬编码 "plains"，否则 kind 被锁成 standard（BUG-100）。
+            # _biome_pure 不依赖已加载区块，早于区块生成也安全。
+            biome = self._biome_pure(sx, sz)
         # 刷怪点种类：由生物群系决定（data/spawners.json）
         kind = gamedata.spawner_kind_for(biome)
         self.spawners[sid] = Spawner(
@@ -1029,7 +1165,9 @@ class Universe:
 
     def _is_on_path(self, x: int, z: int, margin: int = 1) -> bool:
         """检查格子是否在任何路径上（O(1) 预计算集合查询）"""
-        if margin <= 1:
+        # margin<=0 才是"仅查本格"；margin=1 走下方邻域循环（3×3 缓冲），
+        # 否则 margin=1 与 0 等价，路径旁 1 格的缓冲失效（BUG-093）。
+        if margin <= 0:
             return (x, z) in self._path_cells
         for dx in range(-margin, margin + 1):
             for dz in range(-margin, margin + 1):
@@ -1045,8 +1183,8 @@ class Universe:
 
         chunk = self.chunks[(cx, cz)]
         props = []
-        # 区块独立 RNG：同种子+同坐标→同一组道具，不依赖加载顺序
-        chunk_rng = random.Random(self.seed ^ (cx * 7919 + cz * 104729))
+        # 每格独立 RNG 在格内循环创建（见下）；不再用区块级 chunk_rng，
+        # 避免 path_cells/harvested_cells 跳过格时改变整块随机序列。
 
         # 按群系预筛候选道具（每个区块只算一次，避免 256 格重复遍历 PROP_TYPES）。
         # 顺序与逐格 [pt for pt in PROP_TYPES.values() if biome in pt.biomes]
@@ -1090,9 +1228,16 @@ class Universe:
                                   if biome in pt.biomes]
                     candidates_by_biome[biome] = candidates
 
+                # 每格独立 RNG：道具只依赖本格坐标，path_cells/harvested_cells
+                # 的跳过不再影响其他格的随机序列 → 同种子同坐标同道具，区块
+                # LRU 淘汰再生成也不变（原 chunk_rng 序列随跳过格数变化，
+                # 破坏"同种子同坐标同道具"不变式）。
+                cell_rng = random.Random(
+                    self.seed ^ (cx * 7919 + cz * 104729)
+                    ^ (lx * 131 + lz * 17))
                 for pt in candidates:
-                    if chunk_rng.random() < pt.spawn_chance:
-                        size_val = chunk_rng.uniform(pt.min_size, pt.max_size)
+                    if cell_rng.random() < pt.spawn_chance:
+                        size_val = cell_rng.uniform(pt.min_size, pt.max_size)
                         prop = Prop(
                             x=x, z=z, y=surface_y + 1.0,
                             prop_type=pt, size=size_val,
@@ -1157,7 +1302,10 @@ class Universe:
             drop = self.rng.choice(drops)
             surface_y = self.get_surface_height(x, z)
             pickup = Pickup(
-                position=(x + 0.5, surface_y + 0.5, z + 0.5),
+                # 宝箱落在地表之上（surface_y 是表面方块索引，其顶面在
+                # surface_y+1），与 _scatter_props_for_chunk 的 surface_y+1.0
+                # 一致；原 surface_y+0.5 是不透明表面方块中心，宝箱被埋（BUG-094）。
+                position=(x + 0.5, surface_y + 1.0, z + 0.5),
                 item_type=drop[0],
                 item_name=drop[1],
                 amount=drop[2],

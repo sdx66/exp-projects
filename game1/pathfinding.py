@@ -8,8 +8,9 @@ pathfinding.py - 敌人寻路系统
     天然可比：A* 最小化总时间。
   - 边代价 = 距离/移动速度倍率 + 爬升软代价 + 挖方时间 + 拆塔时间×(1-意愿)
     + 拥挤惩罚 + 变体分流惩罚。
-  - 硬约束：上行超过爬坡上限且不可挖 → 禁行；下行超过坠落上限 → 禁行；
-    海洋禁行。这保证"高差足够大一定绕行"。
+  - 硬约束：上行超过爬坡上限且不可挖 → 禁行；海洋禁行；下行超过类型
+    fall_limit → 禁行。这保证"高差足够大一定绕行"（下行硬禁与运行时
+    _sync_y 重力下落 + fall_limit 跨格硬限对齐，BUG-102）。
   - 搜索限制在刷怪点→大本营直线的走廊内（半宽由类型绕远容忍推导）。
   - 平滑 = string-pulling（LOS 不跨越禁行边/塔/挖方格）+ 转角弦切圆角。
   - Pathfinder 按 (刷怪点×类型) 缓存多条变体；world_version 变化后惰性重算，
@@ -42,7 +43,7 @@ class CorridorGrid:
 
     __slots__ = ("x0", "z0", "w", "h", "heights", "land", "biome_codes",
                  "biome_names", "blk_codes", "blk_names", "half_width",
-                 "max_height", "corridor")
+                 "max_height", "corridor", "no_dig_mask", "dig_floor")
 
     def __init__(self, universe, sx, sz, bx, bz, half_width):
         self.half_width = half_width
@@ -95,7 +96,31 @@ class CorridorGrid:
                     heights.flat[i] = y
         self.heights = heights
         self.max_height = universe.height
-        self.land = hn >= 0.20
+        self.land = hn >= 0.005
+        # 大本营 5×5 禁挖区（与 world.dig_forbidden_at 同框）：A* 不规划
+        # "挖上去进大本营"的边——那种挖掘会被守卫拒绝，敌人只能从地表
+        # 接近。不 slam 这条边的话，深隧道会一路挖到基地边上再靠攀爬
+        # 兜底钻出地基（"地面完好从地下钻出来"）。掩码数组供 A* 热循环
+        # O(1) 查表。
+        self.no_dig_mask = np.zeros(hn.shape, dtype=bool)
+        for dx in range(-2, 3):
+            for dz in range(-2, 3):
+                i = self.idx(universe.base_x + dx, universe.base_z + dz)
+                if i >= 0:
+                    self.no_dig_mask.flat[i] = True
+
+        # 大本营平台挖掘守卫（D2）：平台圆盘内每列的"开挖台阶高度下限"。
+        # 与 world.Universe.enemy_dig_floor 同源（同一半径、同一基准面），
+        # A* 热循环直接查表判定"这次上行挖掘会不会把敌人锁死在平台边缘"。
+        # -1 = 该列无守卫。开挖后台阶高度 = 当前格高度+1（见 _update_dig 的
+        # mark_passage(target, base+1) 语义），低于下限即禁行。
+        plat = universe.base_platform_height()
+        dig_floor = np.full(hn.shape, -1, dtype=np.int64)
+        guard = (np.hypot(X - universe.base_x, Z - universe.base_z)
+                 < config.BASE_DIG_GUARD_RADIUS)
+        if guard.any():
+            dig_floor[guard] = plat - config.BASE_DIG_GUARD_FLOOR
+        self.dig_floor = dig_floor
 
         # 湿度（含大本营填平）
         m_cfg = config.NOISE_CFG["moisture"]
@@ -126,7 +151,12 @@ class CorridorGrid:
                 biome_names.append(name)
             codes[mask] = idx
 
-        ocean = hn < 0.004
+        # 海洋阈值 h<0.005 与 chunk._generate / world._biome_and_block_pure /
+        # ui_minimap.compute_surface_blocks 一致（BUG-125 同步）。森林同样只
+        # 覆盖温带低地：temp>=3 下界 + 海拔上界，与 chunk.py L295-297 逐字一致，
+        # 否则高湿度的 snowy/tundra/mountain 格被改标 forest，A* 以 forest=1.0
+        # 计价而非 snowy 0.8 / tundra 0.85 / mountain 0.6，系统性错估通行时间。
+        ocean = hn < 0.005
         _assign(ocean, "ocean")
         _assign((temp < -10.0) & (hn >= 0.18), "snowy")
         _assign((temp >= -10.0) & (temp < 3.0) & (hn >= 0.18), "tundra")
@@ -134,7 +164,9 @@ class CorridorGrid:
                 & (hn >= 0.18), "mountain")
         _assign((temp > 25.0) & (moist < 0.3) & (hn >= 0.18), "desert")
         _assign((temp > 20.0) & (moist >= 0.3) & (hn >= 0.18), "savanna")
-        _assign((temp < 15.0) & (moist > 0.5) & (hn >= 0.18), "forest")
+        _assign((temp < 15.0) & (temp >= 3.0) & (moist > 0.5) & (hn >= 0.18)
+                & (altitude <= config.MOUNTAIN_ALT_RATIO * universe.height),
+                "forest")
         self.biome_names = biome_names
         self.biome_codes = codes
 
@@ -194,7 +226,7 @@ class CostProfile:
     所有代价单位为秒。同一走廊网格可配不同画像跑多次 A*（变体）。
     """
 
-    __slots__ = ("climb_pass", "fall_max", "dig_speed", "crowd_cost",
+    __slots__ = ("climb_pass", "fall_limit", "dig_speed", "crowd_cost",
                  "climb_cost", "tower_cost", "wall_cost", "weather_mult", "rng",
                  "tower_cells", "wall_cells", "occupancy", "divert", "time1",
                  "terrain_mults", "affinity_mults", "siege", "grid")
@@ -209,7 +241,9 @@ class CostProfile:
         self.grid = grid
         # 爬坡上限：整格通行上限（分数部分向下取整，2.5 → 可直接爬 2 格）
         self.climb_pass = max(1, int(math.floor(pers.get("climb_limit", 1.5))))
-        self.fall_max = config.PATH_FALL_LIMIT
+        # 下落上限：可下落高差上限（格，超出则下行该边禁行）。按类型
+        # personality.fall_limit 读取，与运行时 _sync_y 重力下落对齐。
+        self.fall_limit = max(1, int(math.floor(pers.get("fall_limit", 3))))
         self.dig_speed = float(pers.get("dig_speed", 0.0))
         self.crowd_cost = (config.PATH_CROWD_CELL_COST
                            * float(pers.get("crowd_avoidance", 0.5)))
@@ -295,6 +329,8 @@ def astar(grid: CorridorGrid, profile: CostProfile,
     land = grid.land.ravel()
     heights = grid.heights.ravel()
     corridor = grid.corridor.ravel()
+    no_dig_mask = grid.no_dig_mask.ravel()
+    dig_floor = grid.dig_floor.ravel()
     time1 = profile.time1
     grid_w = grid.h  # 扁平索引步长（dx 方向一行的长度）
 
@@ -312,7 +348,7 @@ def astar(grid: CorridorGrid, profile: CostProfile,
     crowd_cost = profile.crowd_cost
     divert = profile.divert
     climb_pass = profile.climb_pass
-    fall_max = profile.fall_max
+    fall_limit = profile.fall_limit
     dig_speed = profile.dig_speed
     climb_cost = profile.climb_cost
 
@@ -354,14 +390,27 @@ def astar(grid: CorridorGrid, profile: CostProfile,
             ni = rx * grid_w + rz
             if ni in closed or not land[ni] or not corridor[ni]:
                 continue
-            if diag and wall_cells:
-                # 禁止沿两面墙的对角夹缝斜向穿越（corner cut）。
-                # 斜向走 (cx,cz)→(cx+ddx,cz+ddz) 时，两面墙若恰好占据
-                # (cx+ddx,cz) 与 (cx,cz+ddz)，则走廊在该处被对角连续墙
-                # 封死 —— 不加此检查会让"横竖连续和对角连续"的防御塔
-                # 中间留出一条可挤过的对角缝。
-                if ((grid.x0 + cx + ddx, grid.z0 + cz) in wall_cells
-                        or (grid.x0 + cx, grid.z0 + cz + ddz) in wall_cells):
+            if diag:
+                # 禁止对角夹缝斜向穿越（corner cut）。
+                # 斜向走 (cx,cz)→(cx+ddx,cz+ddz) 会擦过 (cx+ddx,cz) 与
+                # (cx,cz+ddz) 两正交格的角。若其中任一格不可通行（墙、
+                # 水域或禁行走廊），此斜步会切过障碍角——必须拒绝。
+                # 原实现只对 wall_cells 检查，未检查陆地/走廊硬约束，
+                # 导致 [陆 水 / 水 陆] 2×2 夹缝中可斜穿海洋/禁行区。
+                oi1 = (cx + ddx) * grid_w + cz
+                oi2 = cx * grid_w + (cz + ddz)
+                if (not land[oi1] or not corridor[oi1]
+                        or not land[oi2] or not corridor[oi2]):
+                    continue
+                if wall_cells and ((grid.x0 + cx + ddx, grid.z0 + cz) in wall_cells
+                                   or (grid.x0 + cx, grid.z0 + cz + ddz) in wall_cells):
+                    continue
+                # 扫过格高度也需检查（BUG-051）：擦过的正交格若是过高/过深的
+                # 崖体，斜步会切过实心岩体，故按爬升阈值拒绝上爬、按运行时
+                # 语义放行下坠（BUG-102：下坠无硬上限，只有软代价）。
+                h1 = heights[oi1]
+                h2 = heights[oi2]
+                if (h1 - ch > climb_pass or h2 - ch > climb_pass):
                     continue
             nh = heights[ni]
             dh = nh - ch
@@ -369,14 +418,29 @@ def astar(grid: CorridorGrid, profile: CostProfile,
                 if dh > climb_pass:
                     if dig_speed <= 0:
                         continue  # 爬不上去也不能挖 → 绕行
+                    if no_dig_mask[ni]:
+                        continue  # 大本营 5×5 禁挖区：不能"挖上去"→ 绕行
+                    # 平台挖掘守卫（D2）：在平台圆盘内开挖会产生"当前格+1"
+                    # 的台阶，若低于平台下限则会把敌人锁在平台边缘回不去
+                    # （运行时 enemy_dig_refused 同源拒绝）→ 该边禁行。
+                    df = dig_floor[ni]
+                    if df >= 0 and ch + 1 < df:
+                        continue
                     need = dh - climb_pass
-                    t = base_d * (cur_time1 + time1[ni]) * 0.5 + need / dig_speed
+                    # 可攀段（climb_pass）同样要计爬升软代价，否则挖坡路线被
+                    # 系统性低估、劣于绕行也可能被选中（BUG-052）。
+                    t = (base_d * (cur_time1 + time1[ni]) * 0.5
+                         + climb_pass * climb_cost + need / dig_speed)
                 else:
                     t = (base_d * (cur_time1 + time1[ni]) * 0.5
                          + dh * climb_cost)
             elif dh < 0:
-                if -dh > fall_max:
-                    continue  # 崖太深 → 绕行
+                # 下行：超过类型 fall_limit 硬禁行（与运行时 _sync_y 重力下落
+                # + 跨格 fall_limit 硬限对齐，BUG-102 改版）。落差 ≤ fall_limit
+                # 的下坡/浅坑正常通行（运行时抛物线落到底），超过则该边视为墙，
+                # A* 绕行——避免敌人从过高高台"滑翔"式强坠。
+                if -dh > fall_limit:
+                    continue
                 t = base_d * (cur_time1 + time1[ni]) * 0.5
             else:
                 t = base_d * (cur_time1 + time1[ni]) * 0.5
@@ -449,44 +513,71 @@ def _walk_cells(a, b):
         yield (x, z)
 
 
-def _los_ok(grid: CorridorGrid, climb_pass: int, fall_max: int,
+def _los_ok(grid: CorridorGrid, climb_pass: int, fall_limit: int,
             tower_cells, wall_cells=(), a=None, b=None) -> bool:
-    """格 a→b 直线是否可走（不跨海洋/塔/超限高差）。
+    """格 a→b 直线是否可走（不跨海洋/塔/超爬升阈值/超下落上限）。
 
     用 DDA 精确枚举穿过格（与敌人运行时进入格检测一致），逐格校验。
-    额外禁止沿两面墙的对角夹缝斜穿（与 A* 的 corner-cut 检查一致），
-    否则平滑拉直可能把两段折线拉成一条斜穿对角墙缝的直线。
+    额外禁止对角夹缝斜穿：斜率恰为 ±1 时 DDA 直接跨对角、跳过两正交格，
+    若任一正交格不可通行（海洋/禁行走廊/墙），斜线即切过其角——与 A*
+    的 2×2 夹缝 corner-cut 检查（land+corridor+wall）保持一致，否则平滑
+    拉直可把两段折线拉成斜穿水/禁行/墙角的直线。
+    下坠同样硬限（BUG-102 改版）：相邻两格落差 > fall_limit（下坠方向）
+    即拒绝，与 astar 下行硬禁行、运行时跨格 fall_limit 检查对齐；
+    上爬仍限 climb_pass（不越过未挖的墙）。
     """
     heights = grid.heights.ravel()
     land = grid.land.ravel()
+    corridor = grid.corridor.ravel()
+    # 实走的是格心连线（平滑路径点均为 x+0.5/z+0.5），而 _walk_cells 直接以
+    # 整数格坐标走线会扫描"格角"而非"格心"穿越的格子集合（例 (0,0)→(3,1)
+    # 漏检 (2,1) 却多扫 (2,0)），可错放或误拒直线。故统一用格心坐标走线。
     prev_h = None
     prev_cell = None
-    for (cx, cz) in _walk_cells(a, b):
+    for (cx, cz) in _walk_cells((a[0] + 0.5, a[1] + 0.5), (b[0] + 0.5, b[1] + 0.5)):
         i = grid.idx(cx, cz)
         if i < 0 or not land[i]:
             return False
         if tower_cells and (cx, cz) in tower_cells:
             return False  # 塔格保持为路径顶点（攻击逻辑需要）
-        if wall_cells and prev_cell is not None:
+        if prev_cell is not None:
             pcx, pcz = prev_cell
             ddx, ddz = cx - pcx, cz - pcz
             if ddx != 0 and ddz != 0:
-                # 斜向跨格：两侧相邻格若为墙，则该斜线穿过对角夹缝
-                if ((pcx + ddx, pcz) in wall_cells
-                        or (pcx, pcz + ddz) in wall_cells):
+                # 斜向跨格 (pcx,pcz)→(cx,cz)：检查被擦过的两正交格
+                # (pcx+ddx,pcz) 与 (pcx,pcz+ddz)。任一侧不可通行即拒。
+                o1 = grid.idx(pcx + ddx, pcz)
+                o2 = grid.idx(pcx, pcz + ddz)
+                if (o1 < 0 or not land[o1] or not corridor[o1]
+                        or o2 < 0 or not land[o2] or not corridor[o2]):
+                    return False
+                if wall_cells and ((pcx + ddx, pcz) in wall_cells
+                                   or (pcx, pcz + ddz) in wall_cells):
+                    return False
+                # 被擦过格的高度同样受高差阈值约束（BUG-053/BUG-102）：
+                # 上爬限 climb_pass（防 LOS 切过不可攀的崖角）；下坠限
+                # fall_limit（与 astar 下行硬禁行一致，不切过超高落差）。
+                h1 = heights[o1]
+                h2 = heights[o2]
+                if (h1 - prev_h > climb_pass
+                        or h2 - prev_h > climb_pass
+                        or prev_h - h1 > fall_limit
+                        or prev_h - h2 > fall_limit):
                     return False
         prev_cell = (cx, cz)
         h = heights[i]
         if prev_h is not None:
             dh = h - prev_h
-            if dh > climb_pass or -dh > fall_max:
+            if dh > climb_pass:
                 return False
+            if prev_h - h > fall_limit:
+                return False  # 下坠落差超 fall_limit：硬禁（对齐运行时）
         prev_h = h
     return True
 
 
 def smooth_cells(grid: CorridorGrid, cells: list, climb_pass: int,
-                 fall_max: int, tower_cells, wall_cells=()) -> tuple:
+                 fall_limit: int, tower_cells, wall_cells=()) -> tuple:
     """A* 格路径 → 平滑世界点折线 ((x, y, z), ...)。
 
     1) string-pulling 拉直（LOS 约束：不跨海/塔/超限高差）
@@ -501,7 +592,7 @@ def smooth_cells(grid: CorridorGrid, cells: list, climb_pass: int,
     n = len(cells)
     while i < n - 1:
         j = n - 1
-        while j > i + 1 and not _los_ok(grid, climb_pass, fall_max,
+        while j > i + 1 and not _los_ok(grid, climb_pass, fall_limit,
                                         tower_cells, wall_cells,
                                         cells[i], cells[j]):
             j -= 1
@@ -534,11 +625,11 @@ def smooth_cells(grid: CorridorGrid, cells: list, climb_pass: int,
         bx_ = vx + (nx_ - vx) * cut
         bz_ = vz + (nz_ - vz) * cut
         # 弦切点须仍可走（LOS 检查两段新短线 + 弦本身），否则保留原顶点
-        if (_los_ok(grid, climb_pass, fall_max, tower_cells, wall_cells,
+        if (_los_ok(grid, climb_pass, fall_limit, tower_cells, wall_cells,
                     _cell_of(pts[k - 1]), _cell_of((ax_, az_)))
-                and _los_ok(grid, climb_pass, fall_max, tower_cells, wall_cells,
+                and _los_ok(grid, climb_pass, fall_limit, tower_cells, wall_cells,
                             _cell_of((ax_, az_)), _cell_of((bx_, bz_)))
-                and _los_ok(grid, climb_pass, fall_max, tower_cells, wall_cells,
+                and _los_ok(grid, climb_pass, fall_limit, tower_cells, wall_cells,
                             _cell_of((bx_, bz_)), _cell_of(pts[k + 1]))):
             shaped.append((ax_, az_))
             shaped.append((bx_, bz_))
@@ -555,7 +646,7 @@ def smooth_cells(grid: CorridorGrid, cells: list, climb_pass: int,
     for (wx, wz) in shaped:
         if last is not None:
             dx = wx - last[0]
-            dz = wz - last[1]
+            dz = wz - last[2]  # 点是 (x, y+1, z)，z 分量是 [2]（原误用 [1] 高度分量，去密失效）
             if dx * dx + dz * dz < min_d2:
                 continue
         gx = wx - grid.x0
@@ -584,17 +675,16 @@ def _cell_of(pt):
 def _bilinear_y(heights, land, w, h, ix, iz, fx, fz):
     """走廊网格内双线性插值地表高度。
 
-    注意：land 参数当前未被使用——插值对所有在界内的邻居列一视同仁，
-    仅对越界邻居回退为主列高度。docstring 原述"不可通行列取主列值"
-    与实现不符，故此处如实标注。保留 land 参数以兼容调用方。
+    不可通行（非陆地/越界）的邻居列取主列高度 h00（docstring 原述
+    "不可通行列取主列值"），避免海岸格的插值 Y 被海底高度拉低。
     """
     h00 = heights[ix * h + iz]
     h10 = h01 = h11 = h00
-    if ix + 1 < w:
+    if ix + 1 < w and land[(ix + 1) * h + iz]:
         h10 = heights[(ix + 1) * h + iz]
-    if iz + 1 < h:
+    if iz + 1 < h and land[ix * h + iz + 1]:
         h01 = heights[ix * h + iz + 1]
-    if ix + 1 < w and iz + 1 < h:
+    if ix + 1 < w and iz + 1 < h and land[(ix + 1) * h + iz + 1]:
         h11 = heights[(ix + 1) * h + iz + 1]
     return (h00 * (1 - fx) * (1 - fz) + h10 * fx * (1 - fz)
             + h01 * (1 - fx) * fz + h11 * fx * fz)
@@ -621,6 +711,13 @@ class Pathfinder:
         self._fail_logged: dict = {}    # (sid, type_name) -> 已告警的 world_version
         self._budget = 0
         self._seen_version = -1
+        # D3 局部重规划缓存：((sx,sz), type_name) -> (world_version, PathData|None)
+        # 有界（PATH_LOCAL_GRID_CACHE_MAX），FIFO 淘汰；版本变化整体失效。
+        self._local_cache: dict = {}
+        # 升级阶梯记忆：(sid, type_name) -> 上次成功的最小走廊半宽。
+        # 地形版本变化后优先按它重试，避免每次 bump 都全阶梯重跑（深层
+        # 阶梯是秒级开销，挖掘频繁的坑底世界依赖此记忆）。
+        self._pref_half: dict = {}
 
     def begin_frame(self):
         self._budget = config.PATH_REPATH_BUDGET_PER_FRAME
@@ -634,6 +731,7 @@ class Pathfinder:
     def invalidate(self):
         """world_version 变化后：全部变体与走廊网格标脏（惰性重算）。"""
         self._grid_cache.clear()
+        self._local_cache.clear()
         for key, entry in self.variants.items():
             entry["version"] = -1
 
@@ -660,6 +758,12 @@ class Pathfinder:
         u = self.universe
         grid = CorridorGrid(u, sp.x, sp.z, u.base_x, u.base_z, half)
         self._grid_cache[key] = grid
+        # FIFO 有界（D1b 放宽走廊后同一点会缓存多个宽度，防内存膨胀）
+        while len(self._grid_cache) > config.PATH_GRID_CACHE_MAX:
+            oldest = next(iter(self._grid_cache))
+            if oldest == key:
+                break
+            del self._grid_cache[oldest]
         return grid
 
     def get_variants(self, sid: int, type_name: str) -> list:
@@ -674,17 +778,53 @@ class Pathfinder:
         entry = self.variants.get(key)
         if entry is not None and entry["version"] == version:
             return entry["paths"]
+        # 硬组合（升级阶梯才有路的组合）版本变化时不立即重建：它们每次
+        # 重算都要跑秒级阶梯 A*，而挖掘频繁的世界（敌人自己挖台阶）每个
+        # 挖掘会话都会 bump 版本，逐 bump 重算会把帧时间吃光（坑底/高山
+        # 世界的仿真因此慢到不可用）。沿用旧变体，直到首段不可走
+        # （_request_repath 里 _approach_ok 失败 → rebuild_key 强制重算）
+        # 或停滞看门狗介入（局部优先）。普通组合保持原有"版本变化即重算"。
+        if (entry is not None and entry["paths"]
+                and key in self._pref_half):
+            return entry["paths"]
         if self._budget > 0:
             self._budget -= 1
             paths = self._build_variants(sid, type_name)
             self.variants[key] = {"version": version, "paths": paths}
+            # 变体已写回缓存，此时重建路径格集合才包含本次路线（BUG-110）
+            self._rebuild_path_cells()
             return paths
         if entry is not None:
             return entry["paths"]  # stale 或上次失败的空结果，敌人稍后重估
         # 从未有路径：同步补算（出生必须有路）
         paths = self._build_variants(sid, type_name)
         self.variants[key] = {"version": version, "paths": paths}
+        # 同步补算分支同样写回后再重建（BUG-110）
+        self._rebuild_path_cells()
         return paths
+
+    def _rebuild_path_cells(self):
+        """按当前存活路线整体重建 u._path_cells（BUG-110）。
+
+        原实现在 _build_variants 循环内重建，但那时本次刚算出的变体尚未写回
+        self.variants（get_variants/rebuild_key 在调用返回后才赋值），且
+        enemy_paths 也不含变体路线——结果路径格集合里只有上一版本的陈旧格、
+        缺本次路线的格子，道具/物品避让会躲开旧路却正好压在新路上（BUG-055
+        想消除的缺陷以另一种形式复现）。改为在变体写回缓存后统一调用本方法：
+        清空后从 enemy_paths 各点 + self.variants 全部路线重新收集，成为
+        唯一事实来源。
+        """
+        u = self.universe
+        fresh = set()
+        for route in u.enemy_paths.values():
+            fresh.update((math.floor(x), math.floor(z))
+                         for x, _y, z in route.points)
+        for entry in self.variants.values():
+            for variant in entry.get("paths") or []:
+                fresh.update((math.floor(x), math.floor(z))
+                             for x, _y, z in variant.points)
+        u._path_cells.clear()
+        u._path_cells.update(fresh)
 
     def _build_variants(self, sid, type_name) -> list:
         u = self.universe
@@ -736,12 +876,29 @@ class Pathfinder:
                     cells = astar(grid, siege_profile, start, goal,
                                   node_budget=config.PATH_ASTAR_NODE_BUDGET * 2)
                 if cells is None and not widened:
-                    # 攻城仍无解 → 升级到上限宽度走廊（海湾/山脊的出路可能
-                    # 落在容忍度推导的走廊外；detour_tolerance 是代价偏好，
-                    # 硬无路时放宽优先于让敌人退回不懂地形的 legacy 路径）
-                    wide_grid = self._get_grid(
-                        sid, config.PATH_CORRIDOR_MAX_HALF)
-                    if wide_grid is not None and wide_grid is not grid:
+                    # D1b 攻城仍无解 → 走廊升级阶梯逐级放宽重试。
+                    # 实测（反向 BFS 穷举交叉验证）seed3091 有 23 个组合
+                    # 地形可达却被判"无解"，逐项放宽实验证明瓶颈是走廊半宽
+                    # 与节点预算两者（half=160 需 9.6 万展开、360 需 36 万，
+                    # 见 _probe_escalation_need.py 与 config 阶梯注释）。
+                    # detour_tolerance 是代价偏好，硬无路时放宽优先于让
+                    # 敌人退回不懂地形的 legacy 路径。深层升级仅在本版本
+                    # 首次构建时发生，结果随变体缓存复用。
+                    # 性能：记住该 (sid,type) 上次成功的最小半宽（_pref_half），
+                    # 地形版本变化后优先按它重试——挖掘频繁的世界里阶梯全量
+                    # 重跑是秒级开销（坑底世界每次 bump 都会重算），命中
+                    # 记忆宽度可把多次尝试压成一次。记忆宽度失败再走全阶梯。
+                    ladder = list(config.PATH_CORRIDOR_ESCALATION)
+                    pref = self._pref_half.get((sid, type_name))
+                    if pref is not None:
+                        ladder.sort(key=lambda hb: 0 if hb[0] == pref else 1
+                                    if hb[0] < pref else 2)
+                    for esc_half, esc_budget in ladder:
+                        if esc_half <= grid.half_width:
+                            continue
+                        wide_grid = self._get_grid(sid, esc_half)
+                        if wide_grid is None or wide_grid is grid:
+                            continue
                         wide_profile = CostProfile(
                             type_name, u.weather, wide_grid,
                             tower_cells=u._tower_cells,
@@ -751,18 +908,26 @@ class Pathfinder:
                             variant_rng=rng, siege=True)
                         wide_profile.build_time1()
                         cells = astar(wide_grid, wide_profile, start, goal,
-                                      node_budget=config.PATH_ASTAR_NODE_BUDGET * 2)
+                                      node_budget=esc_budget)
                         if cells is not None:
                             widened = True
                             grid = wide_grid
                             self.widened.add((sid, type_name))
+                            self._pref_half[(sid, type_name)] = esc_half
+                            break
                 if cells is None:
                     if not paths:
                         self._log_path_failure(sid, type_name)
                     break
             dig_cells = self._extract_dig_cells(grid, cells, profile.climb_pass)
+            if self._has_forbidden_dig_edge(grid, cells, profile.climb_pass):
+                # BUG-101 规划一致性防线：A* 理论上不可能产出"挖进禁挖区"
+                # 的边，此处若触发说明规划/运行时守卫脱节——弃用该变体。
+                print(f"[pathfinding] 警告: {type_name}@sid={sid} 规划含禁挖区"
+                      f"挖掘边，变体 {k} 已弃用（version={u.world_version}）")
+                break
             pts = smooth_cells(grid, cells, profile.climb_pass,
-                               profile.fall_max, u._tower_cells, u._wall_cells)
+                               profile.fall_limit, u._tower_cells, u._wall_cells)
             if len(pts) < 2:
                 pts = tuple(
                     (x + 0.5, float(grid.heights.ravel()[grid.idx(x, z)]) + 1.0,
@@ -772,8 +937,9 @@ class Pathfinder:
             pd = PathData(pts, len(pts), slope_sum / max(1, len(pts) - 1),
                           frozenset(dig_cells))
             paths.append(pd)
-            # 路径格并入全局路径格集合（道具避让等语义沿用）
-            u._path_cells.update(cells)
+            # 路径格集合的重建已移出本循环：_build_variants 运行期间本次变体
+            # 尚未写回 self.variants，循环内重建会漏掉当前路线（BUG-110），
+            # 改由 get_variants/rebuild_key 写回缓存后调用 _rebuild_path_cells。
             # 下一变体沿此路径加罚 → 走出不同路线
             for c in cells:
                 divert[c] = divert.get(c, 0.0) + config.PATH_VARIANT_DIVERSION
@@ -801,8 +967,16 @@ class Pathfinder:
 
     @staticmethod
     def _extract_dig_cells(grid, cells, climb_pass) -> set:
-        """相邻格上行超过通行上限的目标格 = 需要挖掘的格。"""
+        """相邻格上行超过通行上限的目标格 = 需要挖掘的格。
+
+        BUG-101 一致化：跳过禁挖区（大本营 5×5）内的格。A* 主循环本身就
+        不产生"挖进禁挖区"的边（no_dig_mask，见 astar），这里是防御性兜底，
+        保证 dig_cells（渲染挖掘标记 / 道具避让用）永远不把禁挖格标成待挖。
+        D2 同理跳过会触发平台守卫的格（astar 已禁行，这里保证标记一致）。
+        """
         heights = grid.heights.ravel()
+        ndm = grid.no_dig_mask.ravel()
+        dfl = grid.dig_floor.ravel()
         digs = set()
         for i in range(len(cells) - 1):
             x0, z0 = cells[i]
@@ -810,8 +984,47 @@ class Pathfinder:
             h0 = heights[grid.idx(x0, z0)]
             h1 = heights[grid.idx(x1, z1)]
             if h1 - h0 > climb_pass:
+                i1 = grid.idx(x1, z1)
+                if i1 >= 0 and ndm[i1]:
+                    continue
+                if i1 >= 0 and dfl[i1] >= 0 and h0 + 1 < dfl[i1]:
+                    continue
                 digs.add((x1, z1))
         return digs
+
+    @staticmethod
+    def _has_forbidden_dig_edge(grid, cells, climb_pass) -> bool:
+        """规划出的路线是否包含"挖到拒挖列"的边（理论上不应发生）。
+
+        BUG-101：A* 主循环对所有上行超限边检查 dig 约束并拒绝——
+          1. 挖进大本营 5×5 禁挖区（no_dig_mask）；
+          2. 目标格非陆地/海洋柱（land 掩码直接排除该格）。
+        D2：平台守卫区内会破坏回环台阶的开挖（astar 的 dig_floor 检查）。
+        此检查是规划层的一致性断言：一旦出现，说明规划与运行时
+        的守卫（dig_block_id / enemy_dig_refused）脱节，该变体必须作废
+        而不是下发（否则敌人会走到"需要挖的经过那里，然后挖不动"的死路）。
+        """
+        heights = grid.heights.ravel()
+        land = grid.land.ravel()
+        ndm = grid.no_dig_mask.ravel()
+        dfl = grid.dig_floor.ravel()
+        for i in range(len(cells) - 1):
+            x0, z0 = cells[i]
+            x1, z1 = cells[i + 1]
+            i1 = grid.idx(x1, z1)
+            if i1 < 0 or not land[i1]:
+                continue
+            h0 = heights[grid.idx(x0, z0)]
+            h1 = heights[i1]
+            if h1 - h0 <= climb_pass:
+                continue   # 不是挖掘边
+            # D2 断言：平台区开挖会把敌人锁在平台边缘
+            if dfl[i1] >= 0 and h0 + 1 < dfl[i1]:
+                return True
+            # BUG-101 断言：挖进大本营 5×5 禁挖区
+            if ndm[i1]:
+                return True
+        return False
 
     def render_paths(self) -> dict:
         """渲染用：{(sid, type_name, idx): PathData}（仅缓存中的变体）。"""
@@ -822,3 +1035,129 @@ class Pathfinder:
             for i, pd in enumerate(entry["paths"]):
                 out[(sid, type_name, i)] = pd
         return out
+
+    def rebuild_key(self, sid: int, type_name: str) -> list:
+        """强制同步重算该 (sid, type) 的全部变体并覆盖缓存，返回新列表。
+
+        BUG-103：敌人重寻路时若缓存变体"首段全部不可走"（通常是历史版本
+        记账漏洞：mark_passage 改低列顶未 bump world_version，缓存路径
+        过期却仍被视为当前版本），需要跳过缓存/预算直接按当前地形重算，
+        用新路线判断敌人能否继续走；重算结果同样缓存（含无解）。
+        """
+        version = self.universe.world_version
+        paths = self._build_variants(sid, type_name)
+        self.variants[(sid, type_name)] = {"version": version, "paths": paths}
+        # 强制重算已写回缓存，重建路径格集合（BUG-110）
+        self._rebuild_path_cells()
+        return paths
+
+    # ─── 局部重规划（D3：从敌人当前格而非刷怪点出发） ──────────
+
+    def plan_from(self, start, type_name: str):
+        """从任意世界格规划到大本营的局部路径（D2/D3 卡死自救）。
+
+        与 _build_variants 的区别：起点是敌人当前格而非刷怪点，结果不进
+        变体缓存、不影响变体分流；按 ((起点格, 类型), 版本) 小缓存去重
+        （同一敌人看门狗重试不会重复跑 A*）。
+
+        背景：spawner 侧路线的首段接入检查（_approach_ok）从敌人当前位置
+        出发，一旦敌人已挖到平台边缘/半山腰，所有"从刷怪点出发"的路线都
+        无法就近接入 → 旧实现直接清路径原地等待。实测证明该局面下从脚下
+        出发局部必有路（seed3091 (-3,-1)、seed79 (0,3) 均为 5 格路）。
+
+        返回 PathData 或 None（无解）。失败结果同样入缓存（同版本不重算）。
+        """
+        u = self.universe
+        sx, sz = start
+        gx, gz = u.base_x, u.base_z
+        key = ((sx, sz), type_name)
+        hit = self._local_cache.get(key)
+        if hit is not None and hit[0] == u.world_version:
+            return hit[1]
+
+        path = None
+        if (sx, sz) != (gx, gz):
+            L = math.hypot(gx - sx, gz - sz)
+            base_half = max(4, min(config.PATH_LOCAL_CORRIDOR_MAX,
+                                   8 + int(L * 0.6)))
+            # 局部规划同样逐级放宽：实测 seed148 坑底 tank 从 (54,20) 回
+            # 基地需 half=160（绕坑壁 353 格），基础半宽无解。
+            attempts = [(base_half, config.PATH_ASTAR_NODE_BUDGET)]
+            for esc_half, esc_budget in config.PATH_LOCAL_ESCALATION:
+                if esc_half > base_half:
+                    attempts.append((esc_half, esc_budget))
+            for half, budget in attempts:
+                grid = CorridorGrid(u, sx, sz, gx, gz, half)
+                start_i = grid.idx(sx, sz)
+                goal_i = grid.idx(gx, gz)
+                land = grid.land.ravel()
+                if not (start_i >= 0 and goal_i >= 0
+                        and land[start_i] and land[goal_i]):
+                    continue
+                profile = CostProfile(
+                    type_name, u.weather, grid,
+                    tower_cells=u._tower_cells,
+                    wall_cells=u._wall_cells,
+                    occupancy=self.occupancy)
+                profile.build_time1()
+                cells = astar(grid, profile, (sx, sz), (gx, gz),
+                              node_budget=budget)
+                if cells is None:
+                    # 攻城重试（塔/墙零代价），与 _build_variants 同款回退
+                    siege_profile = CostProfile(
+                        type_name, u.weather, grid,
+                        tower_cells=u._tower_cells,
+                        wall_cells=u._wall_cells,
+                        occupancy=self.occupancy, siege=True)
+                    siege_profile.build_time1()
+                    cells = astar(grid, siege_profile, (sx, sz), (gx, gz),
+                                  node_budget=budget * 2)
+                if cells is None or self._has_forbidden_dig_edge(
+                        grid, cells, profile.climb_pass):
+                    continue
+                pts = smooth_cells(grid, cells, profile.climb_pass,
+                                   profile.fall_limit,
+                                   u._tower_cells, u._wall_cells)
+                if len(pts) < 2:
+                    pts = tuple(
+                        (x + 0.5,
+                         float(grid.heights.ravel()[grid.idx(x, z)]) + 1.0,
+                         z + 0.5) for x, z in cells)
+                slope_sum = sum(abs(pts[i + 1][1] - pts[i][1])
+                                for i in range(len(pts) - 1))
+                path = PathData(pts, len(pts),
+                                slope_sum / max(1, len(pts) - 1),
+                                frozenset(self._extract_dig_cells(
+                                    grid, cells, profile.climb_pass)))
+                break
+
+        # 入缓存（有界 FIFO；含 None 失败结果，同版本不重算）
+        if len(self._local_cache) >= config.PATH_LOCAL_GRID_CACHE_MAX:
+            self._local_cache.pop(next(iter(self._local_cache)))
+        self._local_cache[key] = (u.world_version, path)
+        return path
+
+    # ─── L0 可达性判定（供 Game 守卫/UI/诊断共用） ─────────────
+
+    def reachability(self, sid: int, type_name: str) -> bool:
+        """该 (刷怪点×类型) 当前是否可达大本营（与出兵判定同一口径）。
+
+        结果与变体缓存同版本：有缓存直接查，无缓存触发补算（受每帧预算
+        约束，预算耗尽返回上次已知值——Game 守卫调用频率低，通常立即补上）。
+        """
+        entry = self.variants.get((sid, type_name))
+        version = self.universe.world_version
+        if entry is not None and entry["version"] == version:
+            return bool(entry["paths"])
+        if entry is not None and self._budget <= 0:
+            return bool(entry["paths"])  # 预算耗尽：先按上次结果（帧内稍后再算）
+        paths = self.get_variants(sid, type_name)
+        return bool(paths)
+
+    def blocked_types(self, sid: int) -> list:
+        """该刷怪点当前不可达的类型列表（UI/诊断用）。"""
+        u = self.universe
+        if sid not in u.spawners:
+            return []
+        return [t for t in gamedata.ENEMY_PERSONALITIES
+                if not self.reachability(sid, t)]

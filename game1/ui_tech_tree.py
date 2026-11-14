@@ -16,6 +16,8 @@ import raylib as rl
 import gamedata
 import ui_config as ui
 import tech_tree as tt
+import config
+from items import TOOL_TYPES, MATERIAL_NAMES_CN
 from rl_utils import *
 
 
@@ -35,9 +37,91 @@ class TechTreePanel:
         self._dragging = False
         self._drag_start = (0, 0)
         self._drag_start_pan = (0, 0)
+        self._drag_engaged = False
         self._hover_id = None
         self._hover_btn = False
         self._fit_done = False
+        # 研究目标塔：None=自动(学识最高且满足条件)；否则为研究塔下标（点通道行切换）
+        self.target_lane_index = None
+
+    # ─── 研究通道（多研究塔）辅助 ────────────────────────────
+
+    def _lanes(self):
+        """当前研究通道列表（来自 game；无 game 或场上无研究塔 → 空/仅基地手研）。"""
+        if self.game is None:
+            return []
+        lanes = self.game.research_lanes()
+        return lanes or []
+
+    def lanes_h(self):
+        """研究通道条占用的垂直高度（无研究塔为 0）。"""
+        n = len(self._lanes())
+        if n <= 0:
+            return 0
+        return min(n, ui.TECHTREE_LANE_MAX_ROWS) * ui.TECHTREE_LANE_H
+
+    def lane_rows(self, viewport_w, viewport_h):
+        """各通道行矩形（自底栏向上排列）：[(x, y, w, h, lane_dict), ...]。"""
+        lanes = self._lanes()
+        if not lanes:
+            return []
+        h = ui.TECHTREE_LANE_H
+        n = min(len(lanes), ui.TECHTREE_LANE_MAX_ROWS)
+        rows = []
+        for i in range(n):
+            y = viewport_h - ui.TECHTREE_FOOTER_H - (i + 1) * h
+            rows.append((0, y, viewport_w, h, lanes[i], i))
+        return rows
+
+    def lane_buttons(self, viewport_w, viewport_h):
+        """通道行内交互按钮：[(rect, action), ...]。
+        action = ("lane", i) 切换目标塔 | ("cancel_current", i)
+               | ("cancel_queued", i, queue_index)。
+        取消按钮排在行点击之前（按钮优先命中），行点击矩形最后。
+        """
+        out = []
+        for x, y, w, h, lane, i in self.lane_rows(viewport_w, viewport_h):
+            # 取消按钮矩形须与 _render_lanes 绘制矩形完全一致（否则 1px 错位
+            # 导致边缘点击失灵）：bx=w-15, rect=(y+4, 12, h-8)（BUG-137）。
+            bx = w - 15
+            # 队列项取消按钮（从右往左排）
+            qlen = len(lane.get("queue") or ())
+            for qi in range(min(qlen, 2)):
+                out.append(((bx, y + 4, 12, h - 8), ("cancel_queued", i, qi)))
+                bx -= 22
+            # 当前项取消按钮
+            if lane.get("current"):
+                out.append(((bx, y + 4, 12, h - 8), ("cancel_current", i)))
+            # 整行点击 = 切换目标塔
+            out.append(((x, y, w, h), ("lane", i)))
+        return out
+
+    def _target_tower(self):
+        """返回研究按钮的目标塔（None=自动选最优）。"""
+        lanes = self._lanes()
+        if not lanes:
+            return None
+        if self.target_lane_index is not None and 0 <= self.target_lane_index < len(lanes):
+            return lanes[self.target_lane_index]["tower"]
+        return None
+
+    def _research_click_lane(self, node_id):
+        """复现 game._research_tech 的通道选择，返回点击将占用的通道对象。
+
+        station=false → 基地手研通道（不占研究塔）；station=true 且手动指派
+        目标塔 → 该塔；否则自动选最优塔（game._pick_research_tower），
+        选不到（无研究塔）时返回 None（上游已用"需要研究塔"拦截）。
+        仅用于队列容量预判（BUG-117），不做 station 校验。
+        """
+        game = self.game
+        if game is None:
+            return None
+        if tt.node_station(node_id):
+            tower = self._target_tower()
+            if tower is None:
+                tower = game._pick_research_tower(node_id)
+            return tower
+        return getattr(game, "base_research", None)
 
     @property
     def era_id(self):
@@ -88,7 +172,7 @@ class TechTreePanel:
     def content_bbox(self, positions):
         """计算内容包围盒。"""
         if not positions:
-            return (0, 0, 1, 1)
+            return tt.EMPTY_CONTENT_BBOX
         min_x = min(p[0] for p in positions.values())
         min_y = min(p[1] for p in positions.values())
         max_x = max(p[0] + p[2] for p in positions.values())
@@ -96,11 +180,11 @@ class TechTreePanel:
         return (min_x, min_y, max_x - min_x, max_y - min_y)
 
     def fit_view(self, positions, viewport_w, viewport_h):
-        """适配视口（扣除表头/底栏预留高度后居中）。"""
+        """适配视口（扣除表头/底栏/研究通道条预留高度后居中）。"""
         bbox = self.content_bbox(positions)
         tt.fit_view(self.view, bbox, viewport_w, viewport_h,
                     inset_top=ui.TECHTREE_CONTENT_TOP,
-                    inset_bottom=ui.TECHTREE_CONTENT_BOTTOM)
+                    inset_bottom=ui.TECHTREE_CONTENT_BOTTOM + self.lanes_h())
         self._fit_done = True
 
     def process_input(self, viewport_w, viewport_h):
@@ -187,6 +271,34 @@ class TechTreePanel:
                     self._fit_done = False
                     return
 
+        # 研究通道条：点击行切换目标塔；取消按钮（当前项/队列项）
+        for rect, action in self.lane_buttons(viewport_w, viewport_h):
+            if tt.is_in_rect(mouse_x, mouse_y, rect):
+                if rl.IsMouseButtonPressed(rl.MOUSE_BUTTON_LEFT):
+                    if action[0] == "lane":
+                        _, i = action
+                        # 再次点击已选中行 → 回到自动
+                        self.target_lane_index = None if self.target_lane_index == i else i
+                        return
+                    if action[0] == "cancel_current":
+                        _, i = action
+                        lanes = self._lanes()
+                        if self.game is not None and 0 <= i < len(lanes):
+                            lane = lanes[i]
+                            if lane.get("hand"):
+                                self.game._cancel_research(None, tower=self.game.base_research)
+                            else:
+                                self.game._cancel_research(None, tower=lane["tower"])
+                        return
+                    if action[0] == "cancel_queued":
+                        _, i, qi = action
+                        lanes = self._lanes()
+                        if self.game is not None and 0 <= i < len(lanes):
+                            q = lanes[i].get("queue") or ()
+                            if qi < len(q):
+                                self.game._cancel_research(q[qi])
+                        return
+
         # 研究按钮（仅技术页）
         if self.page == tt.PAGE_BREAKTHROUGHS and self.selected_id:
             btn_rect = self.research_button_rect(viewport_w, viewport_h)
@@ -212,24 +324,42 @@ class TechTreePanel:
                 self._dragging = True
                 self._drag_start = (mouse_x, mouse_y)
                 self._drag_start_pan = (self.view.pan_x, self.view.pan_y)
+                self._drag_engaged = False
 
-            # 拖动中（鼠标持续按住）按位移差更新 pan
-            if self._dragging and rl.IsMouseButtonDown(rl.MOUSE_BUTTON_LEFT):
-                new_pan = tt.drag_pan(
-                    self._drag_start_pan, self._drag_start, (mouse_x, mouse_y))
-                self.view.pan_x = new_pan[0]
-                self.view.pan_y = new_pan[1]
+        # 拖动中（鼠标持续按住）按位移差更新 pan。
+        # 提到 if/else 之外：拖动一旦开始，光标划过节点/边也不能冻结平移（BUG-091）。
+        if self._dragging and rl.IsMouseButtonDown(rl.MOUSE_BUTTON_LEFT):
+            dx = mouse_x - self._drag_start[0]
+            dy = mouse_y - self._drag_start[1]
+            # 阈值是「启动拖动」的一次性门槛：越过后即视为已启动，
+            # 已启动的拖动不再重复做死区判定（否则指针回到按下点会回弹，BUG-080）。
+            if (not self._drag_engaged
+                    and (abs(dx) >= tt.DRAG_THRESHOLD_PX
+                         or abs(dy) >= tt.DRAG_THRESHOLD_PX)):
+                self._drag_engaged = True
+            new_pan = tt.drag_pan(
+                self._drag_start_pan, self._drag_start, (mouse_x, mouse_y),
+                engaged=self._drag_engaged)
+            self.view.pan_x = new_pan[0]
+            self.view.pan_y = new_pan[1]
 
-        # 限制平移（扣除表头/底栏预留高度）
+        # 限制平移（扣除表头/底栏/研究通道条预留高度）
         bbox = self.content_bbox(positions)
         tt.clamp_pan(self.view, bbox, viewport_w, viewport_h,
                      inset_top=ui.TECHTREE_CONTENT_TOP,
-                     inset_bottom=ui.TECHTREE_CONTENT_BOTTOM)
+                     inset_bottom=ui.TECHTREE_CONTENT_BOTTOM + self.lanes_h())
 
     def _on_research_click(self):
-        """研究按钮点击回调。"""
-        if self.game and self.selected_id:
-            self.game._research_tech(self.selected_id)
+        """研究按钮点击回调。
+
+        已排队 → 取消并退款；否则把选中科技加入目标塔队列（自动选最优塔）。
+        """
+        if not (self.game and self.selected_id):
+            return
+        if self.selected_id in self.game._queued_research():
+            self.game._cancel_research(self.selected_id)
+            return
+        self.game._research_tech(self.selected_id, tower=self._target_tower())
 
     def page_tab_rects(self, viewport_w):
         """页面标签矩形。"""
@@ -255,16 +385,33 @@ class TechTreePanel:
         return [(x + i * (era_w + 6), y, era_w, era_h) for i in range(len(gamedata.TECH_ERAS))]
 
     def research_button_rect(self, viewport_w, viewport_h):
-        """研究按钮矩形（让开底栏）。"""
-        return tt.research_button_rect(self.view, viewport_w, viewport_h,
+        """研究按钮矩形（让开底栏与研究通道条）。"""
+        return tt.research_button_rect(self.view, viewport_w,
+                                       viewport_h - self.lanes_h(),
                                        ui.TECHTREE_FOOTER_H)
 
     def render(self, font, viewport_w, viewport_h, game_money=0,
                unlocked_tech=None, researching=None,
-               research_timer=0, research_total=0):
-        """渲染面板。"""
+               research_timer=0, research_total=0, lanes=None):
+        """渲染面板。
+
+        lanes（可选）：[lane_dict, ...] 每座研究塔一条通道（多塔并行/队列）；
+        None 时回退旧单槽参数（researching/timer/total）兼容测试与 profile。
+        """
         if not self.open:
             return
+
+        if lanes is None:
+            # 旧单槽回退：在研注入单通道
+            if researching:
+                lanes = [{"tower": None, "current": researching,
+                          "timer": research_timer, "total": research_total,
+                          "queue": [], "blocked": None}]
+            else:
+                lanes = []
+        elif hasattr(self, "game") and self.game is not None:
+            # 数据始终以 game 为准（读档后 Game 被整体替换，lanes 缓存会过期）
+            lanes = self._lanes()
 
         tree, positions, edges = self.get_layout(viewport_w, viewport_h)
         bbox = self.content_bbox(positions)
@@ -284,25 +431,35 @@ class TechTreePanel:
         # 绘制分隔线
         draw_rect(0, ui.TECHTREE_HEADER_H - 1, viewport_w, 1, color(60, 65, 80))
 
+        # 绘制树内容（边+节点），裁剪到内容区，避免 pan 上移后树内容绘制在
+        # 头部页签之上、遮挡页签；clamp_pan 为查看大树底部允许内容越过
+        # CONTENT_TOP，故此处必须裁剪到 [CONTENT_TOP, viewport_h - CONTENT_BOTTOM
+        # - 通道条高度]。
+        clip_bottom = ui.TECHTREE_CONTENT_BOTTOM + self.lanes_h()
+        rl.BeginScissorMode(
+            0, ui.TECHTREE_CONTENT_TOP, viewport_w,
+            max(1, viewport_h - ui.TECHTREE_CONTENT_TOP - clip_bottom))
         # 绘制边
         self._render_edges(positions, edges, viewport_w, viewport_h)
 
         # 绘制节点
         self._render_nodes(tree, positions, edges, font, viewport_w, viewport_h,
-                           game_money, unlocked_tech, researching,
-                           research_timer, research_total)
+                           game_money, unlocked_tech, lanes)
+        rl.EndScissorMode()
 
         # 绘制信息面板
         if self.info_visible and self.selected_id:
             self._render_info_panel(tree, font, viewport_w, viewport_h,
-                                    game_money, unlocked_tech, researching,
-                                    research_timer, research_total)
+                                    game_money, unlocked_tech, lanes)
 
         # 绘制研究按钮
         if self.page == tt.PAGE_BREAKTHROUGHS and self.selected_id:
             self._render_research_button(tree, font, viewport_w, viewport_h,
-                                         game_money, unlocked_tech, researching,
-                                         research_timer, research_total)
+                                         game_money, unlocked_tech, lanes)
+
+        # 绘制研究通道条（研究塔队列/并行状态）
+        if lanes:
+            self._render_lanes(font, viewport_w, viewport_h, lanes)
 
         # 底部提示
         self._render_footer(font, viewport_w, viewport_h)
@@ -405,15 +562,16 @@ class TechTreePanel:
             draw_line(sx1, sy1, sx2, sy2, c)
 
     def _render_nodes(self, tree, positions, edges, font, viewport_w, viewport_h,
-                      game_money, unlocked_tech, researching,
-                      research_timer, research_total):
-        """渲染节点。"""
+                      game_money, unlocked_tech, lanes):
+        """渲染节点。lanes 为研究通道列表（含在研/排队集合推导）。"""
         visible = tt.visible_nodes(positions, self.view, viewport_w, viewport_h)
         zoom = self.view.zoom
         show_desc = zoom >= tt.LOD_THRESHOLD
         label_size = max(9, min(16, round(13 * zoom)))
         inset = 8 * zoom
         info_size = max(8, min(14, round(11 * zoom)))
+        active_ids = {l["current"] for l in lanes if l.get("current")}
+        queued_ids = {q for l in lanes for q in (l.get("queue") or ())}
 
         for node_id, x, y, w, h in visible:
             sx, sy = tt.graph_to_screen(self.view, x, y)
@@ -423,7 +581,8 @@ class TechTreePanel:
             # 确定节点类型和状态
             if self.page == tt.PAGE_BREAKTHROUGHS:
                 node = tree.nodes.get(node_id, {})
-                state = tree.node_state(node_id, unlocked_tech or set(), researching)
+                state = tree.node_state(node_id, unlocked_tech or set(),
+                                        active_ids, queued_ids)
             else:
                 ach = tree.achievements.get(node_id, {})
                 state = tree.achievement_state(node_id, unlocked_tech or set())
@@ -453,11 +612,40 @@ class TechTreePanel:
                              label_size, text_color)
 
                 if show_desc and zoom >= 1.0:
-                    cost_text = f"💰{cost}"
+                    cost_text = f"${cost}"
                     draw_text(cost_text,
                                  sx + sw - measure_text(cost_text, info_size) - 4,
                                  sy + (sh - info_size) / 2,
                                  info_size, color(255, 215, 0))
+
+                # 站点标记：station=true 需研究塔；station=false 手研即可（右下角小角标）
+                if sw >= 26 and sh >= 16:
+                    bs = max(10, min(16, int(12 * zoom)))
+                    bx = int(sx + sw - bs - 2)
+                    byy = int(sy + sh - bs - 2)
+                    if tree.node_station(node_id):
+                        draw_rect(bx, byy, bs, bs, color(90, 80, 140, 220))
+                        draw_text("塔", bx + 1, byy + 1,
+                                  max(8, min(12, int(9 * zoom))), color(220, 210, 255))
+                    else:
+                        draw_rect(bx, byy, bs, bs, color(60, 130, 70, 220))
+                        draw_text("手", bx + 1, byy + 1,
+                                  max(8, min(12, int(9 * zoom))), color(210, 255, 220))
+                # 排队标记：已在某塔队列等待（左下角小角标）
+                if state == tt.STATE_QUEUED and sw >= 26 and sh >= 16:
+                    bs = max(10, min(16, int(12 * zoom)))
+                    draw_rect(int(sx + 2), int(sy + sh - bs - 2), bs, bs,
+                              color(140, 110, 40, 230))
+                    draw_text("队", int(sx + 3), int(sy + sh - bs - 1),
+                              max(8, min(12, int(9 * zoom))), color(255, 230, 160))
+                # 材料标记：研发需要材料（左上角小角标，如 引火法需薪柴）
+                _mat = tree.node_requirements(node_id)[2]
+                if _mat and sw >= 26 and sh >= 16:
+                    bs = max(10, min(16, int(12 * zoom)))
+                    draw_rect(int(sx + 2), int(sy + 2), bs, bs,
+                              color(120, 90, 30, 220))
+                    draw_text("材", int(sx + 3), int(sy + 3),
+                              max(8, min(12, int(9 * zoom))), color(255, 235, 180))
             else:
                 ach = tree.achievements.get(node_id, {})
                 name = ach.get("name_cn", node_id)
@@ -496,6 +684,8 @@ class TechTreePanel:
             return color(*ui.TECHTREE_NODE_UNLOCKED)
         elif state == tt.STATE_RESEARCHING:
             return color(*ui.TECHTREE_NODE_RESEARCHING)
+        elif state == tt.STATE_QUEUED:
+            return color(110, 95, 40)
         elif state == tt.STATE_AVAILABLE:
             return color(*ui.TECHTREE_NODE_AVAILABLE)
         else:
@@ -509,6 +699,8 @@ class TechTreePanel:
             return color(80, 160, 100)
         elif state == tt.STATE_RESEARCHING:
             return color(200, 150, 50)
+        elif state == tt.STATE_QUEUED:
+            return color(190, 160, 60)
         elif state in (tt.STATE_AVAILABLE, tt.ACH_PARTIAL):
             return color(100, 130, 160)
         else:
@@ -520,14 +712,15 @@ class TechTreePanel:
             return color(220, 255, 220)
         elif state == tt.STATE_RESEARCHING:
             return color(255, 220, 150)
+        elif state == tt.STATE_QUEUED:
+            return color(240, 215, 130)
         elif state in (tt.STATE_AVAILABLE, tt.ACH_PARTIAL):
             return color(220, 220, 240)
         else:
             return color(120, 120, 140)
 
     def _render_info_panel(self, tree, font, viewport_w, viewport_h,
-                           game_money, unlocked_tech, researching,
-                           research_timer, research_total):
+                           game_money, unlocked_tech, lanes):
         """渲染信息面板。"""
         panel_w = ui.TECHTREE_INFO_W
         panel_h = ui.TECHTREE_INFO_H
@@ -552,7 +745,9 @@ class TechTreePanel:
             cat_info = gamedata.TECH_CATEGORIES.get(era_id, {}).get(track, {})
             track_name = cat_info.get("name_cn", track)
 
-            state = tree.node_state(node_id, unlocked_tech or set(), researching)
+            state = tree.node_state(node_id, unlocked_tech or set(),
+                                {l["current"] for l in lanes if l.get("current")},
+                                {q for l in lanes for q in (l.get("queue") or ())})
             cost = node.get("cost", 0)
             time = node.get("time", 0)
             requires = node.get("requires", [])
@@ -577,20 +772,58 @@ class TechTreePanel:
                 y += 18
             # 状态
             state_text = {"unlocked": "✓ 已解锁", "available": "◉ 可研究",
-                          "researching": "⟳ 研究中", "locked": "🔒 未解锁"}.get(state, state)
+                          "queued": "⏳ 已排队", "researching": "⇄ 研究中",
+                          "locked": "× 未解锁"}.get(state, state)
             draw_text(state_text, panel_x + 10, y, ui.TECHTREE_DESC_SIZE, color(200, 200, 220))
             y += 18
-            # 研究中进度（用真实计时器，不再只画一个转圈）
-            if state == "researching" and research_total > 0:
-                done, total, frac = tree.research_progress(
-                    researching, research_timer, research_total)
-                draw_text(f"进度 {frac:.0%}（{done:.0f}/{total:.0f}s）", panel_x + 10, y,
-                          ui.TECHTREE_DESC_SIZE, color(120, 200, 255))
-                y += 18
+            # 在研进度 / 排队位次（定位到具体通道）
+            for li, lane in enumerate(lanes):
+                if lane.get("current") == node_id and lane.get("total", 0) > 0:
+                    done, total, frac = tree.research_progress(
+                        node_id, lane.get("timer", 0.0), lane.get("total", 0.0))
+                    draw_text(f"T{li + 1} 进度 {frac:.0%}（{done:.0f}/{total:.0f}s）",
+                              panel_x + 10, y, ui.TECHTREE_DESC_SIZE, color(120, 200, 255))
+                    y += 18
+                q = lane.get("queue") or ()
+                if node_id in q:
+                    pos = q.index(node_id) + 1
+                    draw_text(f"T{li + 1} 队列第 {pos} 位", panel_x + 10, y,
+                              ui.TECHTREE_DESC_SIZE, color(240, 215, 130))
+                    y += 18
             # 费用/时间
-            cost_text = f"💰{cost}  ⏱{time:.1f}s"
+            cost_text = f"${cost}  {time:.1f}s"
             draw_text(cost_text, panel_x + 10, y, ui.TECHTREE_DESC_SIZE, color(255, 215, 0))
             y += 18
+            # 站点条件（研究塔）：station=true 需研究塔学识/工具/材料；
+            # station=false 无需研究塔，基地手研即可（有 mat_req 则需背包材料）
+            if tree.node_station(node_id):
+                attr_req, tool_req, mat_req = tree.node_requirements(node_id)
+                req_bits = []
+                if attr_req > 0:
+                    req_bits.append(f"学识≥{attr_req}")
+                if tool_req:
+                    req_bits.append("工具:" + ",".join(
+                        TOOL_TYPES.get(t, None).label_cn if t in TOOL_TYPES else t
+                        for t in tool_req))
+                if mat_req:
+                    req_bits.append("材料:" + ",".join(
+                        f"{MATERIAL_NAMES_CN.get(m, m)}x{n}" for m, n in mat_req.items()))
+                cond_text = "塔: " + ("、".join(req_bits) if req_bits else "研究塔")
+                draw_text(cond_text, panel_x + 10, y, ui.TECHTREE_DESC_SIZE, color(180, 170, 255))
+                y += 18
+            else:
+                attr_req, tool_req, mat_req = tree.node_requirements(node_id)
+                bits = []
+                if mat_req:
+                    bits.append("材料:" + ",".join(
+                        f"{MATERIAL_NAMES_CN.get(m, m)}x{n}" for m, n in mat_req.items()))
+                if bits:
+                    draw_text("手研: 无需研究塔，需" + "、".join(bits),
+                              panel_x + 10, y, ui.TECHTREE_DESC_SIZE, color(170, 220, 180))
+                else:
+                    draw_text("手研: 无需研究塔", panel_x + 10, y,
+                              ui.TECHTREE_DESC_SIZE, color(170, 220, 180))
+                y += 18
             # 前置（中文名；有未解锁的前置则标红）
             if requires:
                 req_text = "需: " + "、".join(tree.node_name(r) for r in requires[:3])
@@ -624,7 +857,8 @@ class TechTreePanel:
 
             state = tree.achievement_state(node_id, unlocked_tech or set())
             done, total, frac = tree.achievement_progress(node_id, unlocked_tech or set())
-            eta = tree.eta_seconds(node_id, unlocked_tech or set())
+            eta = tree.eta_seconds(node_id, unlocked_tech or set(),
+                                   lanes=lanes)
 
             y = panel_y + 12
             # 名称
@@ -635,7 +869,7 @@ class TechTreePanel:
             draw_text(info_text, panel_x + 10, y, ui.TECHTREE_DESC_SIZE, color(150, 155, 175))
             y += 18
             # 进度
-            state_text = {"locked": "🔒 未开始", "partial": "◐ 进行中",
+            state_text = {"locked": "× 未开始", "partial": "◐ 进行中",
                           "unlocked": "✓ 已完成"}.get(state, state)
             draw_text(state_text, panel_x + 10, y, ui.TECHTREE_DESC_SIZE, color(200, 200, 220))
             y += 18
@@ -650,12 +884,13 @@ class TechTreePanel:
                 y += 18
 
     def _render_research_button(self, tree, font, viewport_w, viewport_h,
-                                game_money, unlocked_tech, researching,
-                                research_timer=0, research_total=0):
-        """渲染研究按钮。
+                                game_money, unlocked_tech, lanes):
+        """渲染研究按钮（多状态）。
 
-        可研究=高亮；不可研究=显示 can_research 的原因（以前被丢弃）；
-        正在研究本节点=按钮上方画进度条。
+        - 该节点在研 → 进度条 + "研究中 x/y s"（不可点）
+        - 该节点已排队 → "取消排队"（点击退款取消）
+        - 场上无研究塔 → 禁用"需要研究塔"
+        - 否则 → "研究 ($cost)"，被前置/资金/站点/队列满拦截时显示原因
         """
         bx, by, bw, bh = self.research_button_rect(viewport_w, viewport_h)
 
@@ -665,41 +900,166 @@ class TechTreePanel:
 
         node = tree.nodes.get(node_id, {})
         cost = node.get("cost", 0)
-        ok, reason = tree.can_research(node_id, unlocked_tech or set(), game_money, researching)
+        active_ids = {l["current"] for l in lanes if l.get("current")}
+        queued_ids = {q for l in lanes for q in (l.get("queue") or ())}
 
-        if self._hover_btn and ok:
+        # 在研本节点 → 进度展示
+        busy_lane = next((l for l in lanes if l.get("current") == node_id), None)
+        if busy_lane is not None and busy_lane.get("total", 0) > 0:
+            done, total, frac = tree.research_progress(
+                node_id, busy_lane.get("timer", 0.0), busy_lane.get("total", 0.0))
+            draw_rect(bx, by - 10, bw, 6, color(*ui.TECHTREE_LANE_PROGRESS_BG))
+            draw_rect(bx, by - 10, max(1, int(bw * frac)), 6,
+                      color(*ui.TECHTREE_LANE_PROGRESS_FG))
+            draw_rect(bx, by, bw, bh, color(*ui.TECHTREE_BTN_DISABLED))
+            draw_rect_lines(rect(bx, by, bw, bh), 1, color(80, 80, 90))
+            btn_text = f"研究中 {done:.0f}/{total:.0f}s"
+            self._draw_btn_text(btn_text, bx, by, bw, bh, ok=False)
+            return
+
+        # 已排队 → 取消排队按钮（可点）
+        if node_id in queued_ids:
+            btn_text = "取消排队"
+            enabled = True
+            reason = ""
+        else:
+            # 无研究塔：仅 station=true 的科技需要研究塔；station=false 手研即可
+            if not lanes and tree.node_station(node_id):
+                btn_text, enabled, reason, can_ok = "需要研究塔", False, "", False
+            else:
+                ok, reason = tree.can_research(node_id, unlocked_tech or set(),
+                                               game_money, active_ids, queued_ids)
+                can_ok = ok
+                # 站点/材料条件：station=true 对目标塔（或自动最优塔）评估学识/工具/材料；
+                # station=false 手研检查背包研发材料（mat_req）
+                if ok and self.game is not None:
+                    target = self._target_tower()
+                    if target is not None:
+                        st_ok, st_reason = self.game._station_satisfied(node_id, target)
+                    else:
+                        st_ok, st_reason = self.game._station_satisfied(node_id)
+                    if not st_ok:
+                        ok = False
+                        reason = st_reason
+                # 队列容量校验（BUG-117）：与 game._research_tech 的队列上限
+                # 判定同源，否则按钮显示可点、点击却只弹"队列已满"。
+                if ok and self.game is not None:
+                    lane_obj = self._research_click_lane(node_id)
+                    if lane_obj is not None:
+                        total = (len(getattr(lane_obj, "research_queue", ()) or ())
+                                 + (1 if getattr(lane_obj, "research_current", None) else 0))
+                        if total >= config.RESEARCH_QUEUE_MAX:
+                            ok = False
+                            reason = "该研究通道队列已满"
+                btn_text = "研究" + (f" ({cost})" if ok else "")
+                enabled = ok
+
+        if self._hover_btn and enabled:
             bg = color(*ui.TECHTREE_BTN_HOVER)
-        elif ok:
+        elif enabled:
             bg = color(*ui.TECHTREE_BTN_BG)
         else:
             bg = color(*ui.TECHTREE_BTN_DISABLED)
 
         draw_rect(bx, by, bw, bh, bg)
-        draw_rect_lines(rect(bx, by, bw, bh), 1, color(80, 120, 80) if ok else color(80, 80, 90))
+        draw_rect_lines(rect(bx, by, bw, bh), 1,
+                        color(80, 120, 80) if enabled else color(80, 80, 90))
 
-        # 正在研究本节点：按钮上方画进度条
-        if researching == node_id and research_total > 0:
-            done, total, frac = tree.research_progress(
-                researching, research_timer, research_total)
-            draw_rect(bx, by - 10, bw, 6, color(60, 65, 80))
-            draw_rect(bx, by - 10, max(1, int(bw * frac)), 6, color(120, 200, 255))
-            btn_text = f"研究中 {done:.0f}/{total:.0f}s"
-        elif ok:
-            btn_text = f"研究 ({cost})"
-        else:
+        if enabled:
+            btn_text = f"研究 ({cost})" if btn_text == "研究" else btn_text
+        elif reason:
             btn_text = reason
+        self._draw_btn_text(btn_text, bx, by, bw, bh, ok=enabled)
 
-        # 按钮宽度有限，超长截断
+    def _draw_btn_text(self, btn_text, bx, by, bw, bh, ok=True):
+        """按钮文字（超长截断 + 居中绘制，含配色）。"""
         while btn_text and measure_text(btn_text + "…", ui.TECHTREE_BUTTON_SIZE) > bw - 6:
             btn_text = btn_text[:-1]
         if not btn_text:
             btn_text = "…"
-
         draw_text(btn_text,
-                     bx + (bw - measure_text(btn_text, ui.TECHTREE_BUTTON_SIZE)) / 2,
-                     by + (bh - ui.TECHTREE_BUTTON_SIZE) / 2,
-                     ui.TECHTREE_BUTTON_SIZE,
-                     color(*ui.TECHTREE_BTN_TEXT) if ok else color(200, 160, 160))
+                  bx + (bw - measure_text(btn_text, ui.TECHTREE_BUTTON_SIZE)) / 2,
+                  by + (bh - ui.TECHTREE_BUTTON_SIZE) / 2,
+                  ui.TECHTREE_BUTTON_SIZE,
+                  color(*ui.TECHTREE_BTN_TEXT) if ok else color(200, 160, 160))
+
+    def _render_lanes(self, font, viewport_w, viewport_h, lanes):
+        """渲染研究通道条（每座研究塔一行：在研/暂停/空闲 + 队列 + 取消按钮）。
+
+        取消按钮坐标须与 lane_buttons() 完全一致（队列 ✕ 自右往左，当前项 ✕ 在其左）。
+        """
+        rows = self.lane_rows(viewport_w, viewport_h)
+        if not rows:
+            return
+        tree = tt.tech_tree()
+        fs = ui.TECHTREE_FOOTER_SIZE
+        for x, y, w, h, lane, i in rows:
+            tower = lane.get("tower")
+            hand = lane.get("hand", False)
+            lv = getattr(tower, "level", 1)
+            attr = getattr(tower, "research_attribute", lambda: 0)() if tower is not None else 0
+            sel = self.target_lane_index == i
+            draw_rect(int(x), int(y), int(w), int(h),
+                      color(*ui.TECHTREE_LANE_BG_SEL) if sel else color(*ui.TECHTREE_LANE_BG))
+            if sel:
+                draw_rect_lines(rect(x, y, w, h), 1, color(*ui.TECHTREE_LANE_BORDER))
+
+            tx = x + 6
+            if hand:
+                # 基地手研通道（station=false 科技，无需研究塔）
+                head = f"T{i + 1} 手研"
+            else:
+                head = f"T{i + 1} Lv{lv}(学识{attr})"
+            if sel:
+                head = "▶" + head
+            draw_text(head, int(tx), int(y + 5), fs, color(*ui.TECHTREE_LANE_TEXT))
+            tx += measure_text(head, fs) + 12
+
+            cur = lane.get("current")
+            q = lane.get("queue") or ()
+            if cur:
+                name = tree.node_name(cur)
+                total = float(lane.get("total", 0) or 0)
+                timer = float(lane.get("timer", 0) or 0)
+                frac = max(0.0, min(1.0, 1.0 - timer / total)) if total > 0 else 0.0
+                draw_text(f"⇄ {name}", int(tx), int(y + 5), fs, color(255, 220, 150))
+                tx += measure_text(f"⇄ {name}", fs) + 8
+                pb_w = 110
+                draw_rect(int(tx), int(y + h / 2 - 2), pb_w, 5,
+                          color(*ui.TECHTREE_LANE_PROGRESS_BG))
+                if frac > 0:
+                    draw_rect(int(tx), int(y + h / 2 - 2), max(1, int(pb_w * frac)), 5,
+                              color(*ui.TECHTREE_LANE_PROGRESS_FG))
+                tx += pb_w + 8
+                draw_text(f"{max(0.0, timer):.0f}s", int(tx), int(y + 5), fs,
+                          color(160, 200, 235))
+            elif lane.get("blocked"):
+                draw_text(f"⛔ {lane['blocked']}", int(tx), int(y + 5), fs,
+                          color(*ui.TECHTREE_LANE_BLOCKED))
+            else:
+                draw_text("空闲", int(tx), int(y + 5), fs, color(120, 150, 130))
+
+            # 队列文本（右对齐，让开取消按钮区）
+            if q:
+                names = "、".join(tree.node_name(qq) for qq in q[:3])
+                if len(q) > 3:
+                    names += "…"
+                qtext = f"队列{len(q)}: {names}"
+                cancel_area = 14 + min(len(q), 2) * 22 + 10
+                qx = w - cancel_area - measure_text(qtext, fs)
+                qx = max(tx + 10, qx)
+                draw_text(qtext, int(qx), int(y + 5), fs, color(*ui.TECHTREE_LANE_QLEN))
+
+            # 取消按钮（与 lane_buttons 命中矩形完全一致，避免 1px 错位（BUG-137）：
+            # 队列 ✕ 自右往左，当前项 ✕ 在其左）
+            bx = w - 15
+            for qi in range(min(len(q), 2)):
+                draw_rect(bx, int(y + 4), 12, h - 8, color(110, 70, 70))
+                draw_text("✕", bx + 2, int(y + 6), fs, color(235, 190, 190))
+                bx -= 22
+            if cur:
+                draw_rect(bx, int(y + 4), 12, h - 8, color(*ui.TECHTREE_LANE_CANCEL))
+                draw_text("✕", bx + 2, int(y + 6), fs, color(255, 210, 210))
 
     def _render_footer(self, font, viewport_w, viewport_h):
         """渲染底部提示。"""

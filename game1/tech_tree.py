@@ -2,7 +2,7 @@
 tech_tree.py - 科技树运行时模型
 
 纯逻辑、可单测、不依赖 raylib：
-  - 状态计算：locked / available / researching / unlocked
+  - 状态计算：locked / available / queued / researching / unlocked
   - 进度计算：成果完成度、ETA
   - 布局计算：树形布局（技术页自下而上：y=tier 行，x=行内叶序；成果页按轨分列）
   - 命中测试：node_at(screen_pos, view)
@@ -18,6 +18,7 @@ import gamedata
 
 STATE_LOCKED = "locked"
 STATE_AVAILABLE = "available"
+STATE_QUEUED = "queued"          # 已在某座研究塔队列中（等待开始）
 STATE_RESEARCHING = "researching"
 STATE_UNLOCKED = "unlocked"
 
@@ -42,6 +43,9 @@ MIN_ZOOM = 0.35
 MAX_ZOOM = 2.5
 DRAG_THRESHOLD_PX = 4
 
+# 空内容哨兵：无节点时 content_bbox 返回该值，fit_view 据此跳过适配（BUG-079）
+EMPTY_CONTENT_BBOX = (0, 0, 1, 1)
+
 # 依赖线淡化：跨 span 层 → alpha *= EDGE_FADE_DECAY^(span-1)，下限 EDGE_FADE_MIN
 EDGE_FADE_DECAY = 0.68
 EDGE_FADE_MIN = 0.2
@@ -58,6 +62,15 @@ def clear_layout_cache():
 
 
 # ─── 树索引 ───────────────────────────────────────────────────
+
+def _in_busy(busy, node_id):
+    """busy（None | str | 可迭代）是否包含 node_id。"""
+    if busy is None:
+        return False
+    if isinstance(busy, str):
+        return busy == node_id
+    return node_id in busy
+
 
 class TechTree:
     """科技树索引：从 gamedata 构建节点/成果索引和父子关系。"""
@@ -105,15 +118,23 @@ class TechTree:
         for era, tracks in gamedata.TECH_CATEGORIES.items():
             self.era_tracks[era] = list(tracks.keys())
 
-    def node_state(self, node_id, unlocked_set, researching_id=None):
-        """计算节点状态。"""
+    def node_state(self, node_id, unlocked_set, researching_id=None, queued_ids=None):
+        """计算节点状态。
+
+        researching_id / queued_ids 均可为 None | 单个 id | 可迭代集合：
+        - researching_id: 任意一座研究塔正在研究该科技 → researching
+        - queued_ids: 该科技已在某塔队列中（未开始）→ queued
+        优先级：unlocked > researching > queued > available/locked。
+        """
         node = self.nodes.get(node_id)
         if not node:
             return STATE_LOCKED
         if node_id in unlocked_set:
             return STATE_UNLOCKED
-        if node_id == researching_id:
+        if _in_busy(researching_id, node_id):
             return STATE_RESEARCHING
+        if _in_busy(queued_ids, node_id):
+            return STATE_QUEUED
         # 检查前置是否全部解锁
         requires = node.get("requires", [])
         if requires:
@@ -121,6 +142,17 @@ class TechTree:
                 if req not in unlocked_set:
                     return STATE_LOCKED
         return STATE_AVAILABLE
+
+    def missing_requires(self, node_id, unlocked_set):
+        """返回该科技尚未解锁的前置 id 列表（空 = 前置全满足）。
+
+        开始时刻校验用：以"当下已解锁集合"为准，不检查资金（入队时已扣钱）。
+        """
+        node = self.nodes.get(node_id)
+        if not node:
+            return []
+        return [r for r in (node.get("requires", []) or [])
+                if r not in unlocked_set]
 
     def achievement_state(self, ach_id, unlocked_set):
         """计算成果状态。"""
@@ -154,15 +186,52 @@ class TechTree:
         node = self.nodes.get(node_id)
         return (node or {}).get("name_cn") or node_id
 
-    def can_research(self, node_id, unlocked_set, money, researching_id=None):
-        """检查是否可以研究，返回 (ok, reason)。reason 用中文名，直接给玩家看。"""
+    # ─── 站点（研究塔）条件 ──────────────────────────────────
+    # station=true 的突破必须在满足条件的研究塔上开始研究（塔作为条件，
+    # 不割裂面板）：学识 ≥ attr_req，塔内存有所需工具(tool_req)与材料(mat_req)。
+    # 数据驱动：缺省时按时代取默认学识门槛，工具/材料默认空。见 build_tech_data.py。
+
+    ERA_ATTR_DEFAULT = {
+        "stone": 1,
+        "bronze": 2,
+        "iron": 3,
+        "steam": 4,
+        "electric": 5,
+    }
+
+    def node_station(self, node_id):
+        """该突破是否必须在研究塔上研究（缺省 True）。"""
+        node = self.nodes.get(node_id)
+        return bool((node or {}).get("station", True))
+
+    def node_requirements(self, node_id):
+        """返回 (attr_req, tool_req, mat_req) 站点条件，缺省兜底。"""
+        node = self.nodes.get(node_id) or {}
+        era = node.get("era", "stone")
+        attr_req = node.get("attr_req", self.ERA_ATTR_DEFAULT.get(era, 1))
+        tool_req = list(node.get("tool_req", []) or [])
+        mat_req = dict(node.get("mat_req", {}) or {})
+        return int(attr_req), tool_req, mat_req
+
+    def can_research(self, node_id, unlocked_set, money, researching_id=None,
+                     queued_ids=None):
+        """检查是否可以研究，返回 (ok, reason)。reason 用中文名，直接给玩家看。
+
+        researching_id / queued_ids 均为"全塔聚合"的忙项（None|str|可迭代）：
+        - 该科技正在研究中 → "正在研究中"
+        - 该科技已在某塔队列 → "已在队列中"
+        （其他科技在研/排队不再全局禁止——多塔并行与塔内队列是允许的。）
+        前置/资金分支按传入的 unlocked_set（调用方当下的解锁集合）判定。
+        """
         node = self.nodes.get(node_id)
         if not node:
             return False, "节点不存在"
         if node_id in unlocked_set:
             return False, "已解锁"
-        if researching_id and researching_id != node_id:
-            return False, "正在研究其他科技"
+        if _in_busy(researching_id, node_id):
+            return False, "正在研究中"
+        if _in_busy(queued_ids, node_id):
+            return False, "已在队列中"
         requires = node.get("requires", [])
         for req in requires:
             if req not in unlocked_set:
@@ -171,17 +240,38 @@ class TechTree:
             return False, f"资金不足 (需要 {node.get('cost', 0)})"
         return True, "可以研究"
 
-    def eta_seconds(self, ach_id, unlocked_set):
-        """估算成果完成剩余时间（单线研究，下界）。"""
+    def eta_seconds(self, ach_id, unlocked_set, researching_id=None,
+                    research_timer=None, lanes=None):
+        """估算成果完成剩余时间（串行求和，保守"预计"值）。
+
+        在研节点按剩余时间计（而非全量 time），否则对在研节点高估。
+        lanes（可选）：list of (tech_id, remaining) 或 dict(current,timer)，
+        多塔并行时的保守估计；未传 lanes 时回退单槽 (researching_id, research_timer)。
+        """
         ach = self.achievements.get(ach_id)
         if not ach:
             return 0.0
+        # 归一化 lanes → {tech_id: remaining}
+        active = {}
+        if lanes:
+            for lane in lanes:
+                if isinstance(lane, dict):
+                    rid, rt = lane.get("current"), lane.get("timer")
+                else:
+                    rid, rt = lane
+                if rid:
+                    active.setdefault(rid, max(0.0, float(rt)))
+        elif researching_id and research_timer is not None:
+            active[researching_id] = max(0.0, research_timer)
         bts = ach.get("breakthroughs", [])
         total_time = 0.0
         for bt_id in bts:
             if bt_id not in unlocked_set:
                 node = self.nodes.get(bt_id, {})
-                total_time += node.get("time", 0)
+                if bt_id in active:
+                    total_time += active[bt_id]
+                else:
+                    total_time += node.get("time", 0)
         return total_time
 
     def remaining_seconds(self, researching_id, research_timer):
@@ -281,6 +371,9 @@ def fit_view(view, content_bbox, viewport_w, viewport_h,
     inset_top/inset_bottom 是顶/底预留高度，内容在扣除预留后的可用区域内居中。
     """
     cx, cy, cw, ch = content_bbox
+    # 空内容哨兵 (0,0,1,1)：无节点时不做适配，保留当前缩放/平移（BUG-079）
+    if tuple(content_bbox) == EMPTY_CONTENT_BBOX:
+        return
     if cw <= 0 or ch <= 0:
         return
     # 留边距
@@ -299,17 +392,21 @@ def fit_view(view, content_bbox, viewport_w, viewport_h,
     view.pan_y = (top + bottom - ch * zoom) / 2 - cy * zoom
 
 
-def drag_pan(start_pan, start_mouse, mouse, threshold=DRAG_THRESHOLD_PX):
-    """把拖动位移换算为新的 pan；位移小于阈值时保持原 pan 不变。
+def drag_pan(start_pan, start_mouse, mouse, threshold=DRAG_THRESHOLD_PX,
+             engaged=False):
+    """把拖动位移换算为新的 pan。
 
     start_pan: (pan_x, pan_y) 按下时的 pan
     start_mouse: (x, y) 按下时的鼠标位置
     mouse: (x, y) 当前鼠标位置
-    threshold: 拖动的最小位移（像素）
+    threshold: 启动拖动的最小位移（像素）——一次性启动门槛
+    engaged: 拖动是否已启动。阈值只是「开始拖动」的门槛，一旦越过后即视为
+             已启动；已启动的拖动恒按 start_pan + (mouse - start_mouse) 跟随，
+             不再每帧重新做死区判定（否则指针回到按下点附近会回弹，BUG-080）。
     """
     dx = mouse[0] - start_mouse[0]
     dy = mouse[1] - start_mouse[1]
-    if abs(dx) < threshold and abs(dy) < threshold:
+    if not engaged and abs(dx) < threshold and abs(dy) < threshold:
         return start_pan
     return (start_pan[0] + dx, start_pan[1] + dy)
 
@@ -495,11 +592,20 @@ def compute_layout(tree, era_id, page, viewport_w, viewport_h):
         # 成果页边：ach.requires 是该成果 bt 的"外部前置 bt"，经 bt→ach
         # 映射画 ach→ach 边（同期）。成果页不建树（按轨分列），互 ⊕ 在此
         # 只表现为双向边，不影响布局，故无需破环。
+        # 跨时代 ach.requires 边被上方按时代过滤掉、不在本页渲染（有意
+        # 分页设计——成果页只画同期依赖，R2-E5）。
         edges = []
         bt_to_ach = getattr(tree, "bt_to_ach", {})
         for aid, ach in nodes.items():
             for req_bt in ach.get("requires", []):
-                src = bt_to_ach.get(req_bt)
+                # R2-E4：源成果解析统一走 bt 自身的 achievement 字段（信息
+                # 面板同源、稳定）——bt_to_ach 由 ach.breakthroughs 列表按
+                # ach 遍历序构建，多认领 bt 会被后认领者覆盖（如 stone:C3/
+                # C4/C5/C7/C9/J1/J15/J16），导致成果页依赖边与面板指向不同
+                # 成果。bt 无 achievement 字段时兜底回 bt_to_ach。
+                src = tree.nodes.get(req_bt, {}).get("achievement")
+                if not src:
+                    src = bt_to_ach.get(req_bt)
                 if src and src in positions and src != aid:
                     x1, y1, _, _ = positions[src]
                     x2, y2, _, _ = positions[aid]

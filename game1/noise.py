@@ -13,6 +13,12 @@ noise.py - 程序化噪声生成
     几何级数（octaves/persistence/frequency/lacunarity）的薄包装，
     内部调 fbm_levels_*，输出与包装前逐位一致。
 
+生产消费现状（R5-L5，消费口径 = tower_defense 核心模块 + tests）：
+  fbm_levels_2d_vec / fbm_levels_2d / value_noise_2d_vec 为区块/湿度/寻路
+  热路径（chunk/pathfinding/ui_minimap）；fbm_2d 被 generate_heightmap
+  内部与 tests 使用；value_noise_3d / fbm_levels_3d / fbm_2d_vec / fbm_3d
+  生产无外部消费（fbm_levels_3d 仅 profile_suite 验证脚本用）。
+
 标量版用于路径生成等低频调用；向量化版用于区块生成热路径。
 噪声调参见 config.NOISE_CFG。
 """

@@ -27,6 +27,7 @@ BLOCK_ID = {
     "gravel":       13,
     "log":          14,
     "leaves":       15,
+    "uranium_ore":  16,
 }
 
 BLOCK_NAME = {v: k for k, v in BLOCK_ID.items()}
@@ -58,6 +59,7 @@ class BlockDef:
     harvest_amount: int = 0
     placeable: bool = False            # 可被玩家放置
     place_material: Optional[str] = None  # 放置消耗材料，None→用 harvest_material
+    mining_tier: int = 1               # 开采塔采掘所需工具档位(1=任意石镐可挖；矿石更高)
 
 # ─── 方块注册表 ────────────────────────────────────────────
 
@@ -105,7 +107,7 @@ _register(BlockDef(
 _register(BlockDef(
     id=BLOCK_ID["sand"], name="沙子",
     top_color=(219, 207, 163), side_color=(219, 207, 163), bottom_color=(219, 207, 163),
-    solid=True, biomes=("desert", "beach", "river"),
+    solid=True, biomes=("desert", "ocean"),  # 沙：沙漠地表 + 海洋/沿岸格
     temp_min=10.0, temp_max=50.0,
     texture_noise=0.10,
     harvest_material="sand", harvest_amount=1,
@@ -116,7 +118,7 @@ _register(BlockDef(
     id=BLOCK_ID["water"], name="水",
     top_color=(55, 125, 195), side_color=(45, 105, 175), bottom_color=(35, 85, 155),
     solid=False, transparent=True,
-    biomes=("ocean", "river", "lake"),
+    biomes=("ocean",),  # 水：海洋列/地表
     texture_noise=0.08,
 ))
 
@@ -142,7 +144,7 @@ _register(BlockDef(
     id=BLOCK_ID["lava"], name="岩浆",
     top_color=(220, 80, 20), side_color=(200, 60, 10), bottom_color=(180, 50, 5),
     solid=False, transparent=False, emissive=True,
-    biomes=("volcano",),
+    biomes=("mountain",),  # 岩浆：火山/高山（biomes.py 无 volcano 群系）
     temp_min=50.0, temp_max=100.0,
     texture_noise=0.30,
 ))
@@ -157,23 +159,33 @@ _register(BlockDef(
 _register(BlockDef(
     id=BLOCK_ID["iron_ore"], name="铁矿",
     top_color=(160, 140, 120), side_color=(140, 120, 100), bottom_color=(120, 100, 80),
-    solid=True, biomes=("mountain", "stone"),
+    solid=True, biomes=("mountain",),  # 铁矿：深层石（多在山脉）
     texture_noise=0.35,
     harvest_material="iron_ore", harvest_amount=1,
+    mining_tier=2,  # 开采塔需铁镐(档2)以上
 ))
 
 _register(BlockDef(
     id=BLOCK_ID["coal_ore"], name="煤矿",
     top_color=(80, 80, 80), side_color=(70, 70, 70), bottom_color=(60, 60, 60),
-    solid=True, biomes=("mountain", "stone"),
+    solid=True, biomes=("mountain",),  # 煤矿：深层石（多在山脉）
     texture_noise=0.35,
-    harvest_material="iron_ore", harvest_amount=1,  # 煤矿也产铁（简化）
+    harvest_material="coal", harvest_amount=1,  # 煤矿产煤（发电燃料）
+))
+
+_register(BlockDef(
+    id=BLOCK_ID["uranium_ore"], name="铀矿",
+    top_color=(110, 200, 130), side_color=(90, 180, 110), bottom_color=(70, 160, 90),
+    solid=True, biomes=("mountain",),  # 铀矿：罕见深层石（核燃料原料）
+    texture_noise=0.35,
+    harvest_material="uranium_ore", harvest_amount=1,
+    mining_tier=3,  # 开采塔需蒸汽凿岩机(档3)
 ))
 
 _register(BlockDef(
     id=BLOCK_ID["clay"], name="黏土",
     top_color=(160, 160, 180), side_color=(140, 140, 160), bottom_color=(120, 120, 140),
-    solid=True, biomes=("river", "beach"),
+    solid=True, biomes=("plains",),  # 黏土：河岸/平原
     texture_noise=0.10,
 ))
 
@@ -210,7 +222,12 @@ def get_block(id: int) -> BlockDef:
 
 def get_block_by_name(name: str) -> BlockDef:
     """通过名称获取方块定义"""
-    return BLOCKS.get(BLOCK_ID[name], BLOCKS[BLOCK_ID["air"]])
+    bid = BLOCK_ID.get(name)
+    if bid is None:
+        # BLOCK_ID[name] 会先求值再 .get，未知名称直接 KeyError，
+        # air 兜底是死代码；改为先取 id，缺失返回 air。
+        return BLOCKS[BLOCK_ID["air"]]
+    return BLOCKS.get(bid, BLOCKS[BLOCK_ID["air"]])
 
 def is_solid(id: int) -> bool:
     """方块是否实体"""

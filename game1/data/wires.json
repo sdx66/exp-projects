@@ -1,0 +1,35 @@
+{
+  "comment": "电线（输电介质）数据。运行时由 gamedata.py 读取构建 power.WIRES_RAW（power.CableSegment 构造按 kind 直读 WIRES_RAW；不存在 power.WIRE_TYPES 属性）。\n字段: name_cn 显示名 / base_cost 建造费用 / voltage_class 电压等级(LV|MV|HV) /\nrated_voltage_v 额定电压(伏) / max_current_a 最大载流(安) / resistance_per_tile 每格电阻(欧姆) /\nrequires_tech 科技前置(数组,引用 tech.json 突破点 ID) / color [r,g,b]。\n电压等级: LV=220V(低压配电) MV=10000V(中压) HV=110000V(高压远距)。\n电线一格一段、无方向、4 邻接成网；电流 = 功率/电压，损耗 = I^2 * R(每格)。\n电流超限 → 该段跳闸(暂态断路,自动恢复)。不同电压等级电线混接 → 组件电压冲突(不传输)。\nBUG-122: copper_wire 载流 30A→75A。LV 电线须承载最大 LV 电站火电 15kW/220V≈68A\n(水电 12kW≈55A、风电 4kW≈18A、光伏 2.5kW≈11A 均 < 75A)；原 30A(=6.6kW) 使火电/水电\n无法满载运行。MV 铝线 50A(中央 300kW@10kV=30A)、HV 200A(核电 2000kW@110kV=18A) 本就够用。",
+  "wires": {
+    "copper_wire": {
+      "name_cn": "铜线",
+      "base_cost": 25,
+      "voltage_class": "LV",
+      "rated_voltage_v": 220,
+      "max_current_a": 75,
+      "resistance_per_tile": 0.06,
+      "requires_tech": ["electric:eW1"],
+      "color": [210, 122, 72]
+    },
+    "aluminum_wire": {
+      "name_cn": "铝绞线",
+      "base_cost": 60,
+      "voltage_class": "MV",
+      "rated_voltage_v": 10000,
+      "max_current_a": 50,
+      "resistance_per_tile": 0.04,
+      "requires_tech": ["electric:eW5"],
+      "color": [180, 180, 200]
+    },
+    "hv_acsr": {
+      "name_cn": "高压输电线",
+      "base_cost": 150,
+      "voltage_class": "HV",
+      "rated_voltage_v": 110000,
+      "max_current_a": 200,
+      "resistance_per_tile": 0.02,
+      "requires_tech": ["electric:eW7"],
+      "color": [150, 170, 220]
+    }
+  }
+}

@@ -12,6 +12,8 @@ import gamedata
 from blocks import get_block, is_solid, BLOCK_ID
 from biomes import BIOMES
 from items import MATERIAL_COLORS, WEAPON_TYPES
+import belts as belts_mod
+from belts import Belt, DXDZ, BRIDGE_LANES
 from rl_utils import *
 
 FOG_VS = b"""
@@ -48,6 +50,190 @@ void main() {
 """
 
 
+def _draw_belt_3d(draw, belt, mat_color, belt_colors):
+    """3D 画一条传送带（draw = rl.DrawCube；mat_color 材料配色查找）。"""
+    base = (*belt_colors.get(belt.kind, (150, 150, 165)), 255)
+    cx = belt.cell[0] + 0.5
+    cz = belt.cell[1] + 0.5
+    y = belt.y
+    if belt.kind == "bridge":
+        for li, lane in enumerate(belt.lanes):
+            ly = y + (0.22 if li == 1 else 0.0)
+            _draw_belt_lane_3d(draw, lane["direction"], cx, ly, cz, base)
+            for it in lane["items"]:
+                _draw_belt_cargo_3d(draw, lane["direction"], cx, ly, cz, it, mat_color)
+        return
+    draw((cx, y, cz), 0.9, 0.1, 0.9, base)
+    d = belt.direction % 4
+    draw((cx + DXDZ[d][0] * 0.3, y + 0.09, cz + DXDZ[d][1] * 0.3),
+         0.16, 0.06, 0.16, base)
+    for it in belt.items:
+        _draw_belt_cargo_3d(draw, d, cx, y, cz, it, mat_color)
+
+
+def _draw_belt_lane_3d(draw, d, cx, y, cz, base):
+    """桥单条 lane 的扁长条。"""
+    if d in (belts_mod.E, belts_mod.W):
+        draw((cx, y, cz), 0.9, 0.08, 0.22, base)
+    else:
+        draw((cx, y, cz), 0.22, 0.08, 0.9, base)
+
+
+def _draw_belt_cargo_3d(draw, d, cx, y, cz, it, mat_color):
+    """带上一件货物（沿 lane 方向按 head 插值）。"""
+    c = (*mat_color(it["name"], (200, 200, 200)), 255)
+    h = it["head"]
+    ox = (h - 0.5) * DXDZ[d % 4][0]
+    oz = (h - 0.5) * DXDZ[d % 4][1]
+    draw((cx + ox, y + 0.16, cz + oz), 0.16, 0.12, 0.16, c)
+
+
+def _draw_belt_2d(belt, mat_color, belt_colors):
+    """2D 画一条传送带（draw_rect_v / draw_circle_v）。"""
+    base = (*belt_colors.get(belt.kind, (150, 150, 165)), 255)
+    cx = belt.cell[0] + 0.5
+    cz = belt.cell[1] + 0.5
+    if belt.kind == "bridge":
+        for li, lane in enumerate(belt.lanes):
+            _draw_belt_lane_2d(lane["direction"], cx, cz, base,
+                               bright=li == 1)
+            for it in lane["items"]:
+                _draw_belt_cargo_2d(lane["direction"], cx, cz, it, mat_color)
+        return
+    draw_rect_v((cx - 0.45, cz - 0.45), (0.9, 0.9), base)
+    d = belt.direction % 4
+    ax = cx + DXDZ[d][0] * 0.3
+    az = cz + DXDZ[d][1] * 0.3
+    draw_rect_v((ax - 0.08, az - 0.08), (0.16, 0.16), base)
+    for it in belt.items:
+        _draw_belt_cargo_2d(d, cx, cz, it, mat_color)
+
+
+def _draw_belt_lane_2d(d, cx, cz, base, bright=False):
+    """桥单条 lane 的扁条（2D）；bright 抬高一条以示立交。"""
+    c = base if not bright else (min(255, base[0] + 40),
+                                 min(255, base[1] + 40),
+                                 min(255, base[2] + 40), 255)
+    if d in (belts_mod.E, belts_mod.W):
+        draw_rect_v((cx - 0.45, cz - 0.11), (0.9, 0.22), c)
+    else:
+        draw_rect_v((cx - 0.11, cz - 0.45), (0.22, 0.9), c)
+
+
+def _draw_belt_cargo_2d(d, cx, cz, it, mat_color):
+    """带上一件货物（2D 小圆点，沿 lane 方向插值）。"""
+    c = (*mat_color(it["name"], (200, 200, 200)), 255)
+    h = it["head"]
+    ox = (h - 0.5) * DXDZ[d % 4][0]
+    oz = (h - 0.5) * DXDZ[d % 4][1]
+    draw_circle_v((cx + ox, cz + oz), 0.09, c)
+
+
+def _wire_brightness(wire):
+    """电线亮度/过载状态 → (亮暗系数, 过载红)。"""
+    if wire.tripped:
+        return 1.0, True
+    # 按电流占比给亮度（0.4–1.0），带流越强越亮
+    ratio = min(1.0, wire.current / max(1e-6, wire.max_current_a)) if wire.max_current_a > 0 else 0.0
+    return 0.4 + 0.6 * ratio, ratio >= 0.9
+
+
+def _wire_conn_dirs(cell, conn):
+    """电线 4 邻接的连接方向（'N'/'S'/'E'/'W'），conn 为可连接格集合。
+
+    电线一格一段、4 邻接成网，且 4 邻接电站/电池也算连接（线头贴到建筑边）。
+    渲染据此把细条画在"实际连着的方向"上——早先恒画横向条导致南北向
+    电线朝向失真（BUG：电线连上了但朝向不好看）。
+    """
+    x, z = cell
+    dirs = []
+    if (x, z - 1) in conn:
+        dirs.append("N")
+    if (x, z + 1) in conn:
+        dirs.append("S")
+    if (x - 1, z) in conn:
+        dirs.append("W")
+    if (x + 1, z) in conn:
+        dirs.append("E")
+    return dirs
+
+
+def _draw_wire_3d(draw, wire, conn):
+    """3D 画一段电线（沿连接方向的细扁条 + 端点小墩，按电流亮度/跳闸红）。
+
+    每格向"连着的方向"伸半段（0.5 长），相邻格的半段在格边汇合成连续线；
+    只有开路端（该方向无邻居/无电力建筑）才画收口小墩，不再每格都画两根。
+    """
+    base = (*gamedata.WIRE_COLORS.get(wire.kind, (180, 180, 200)), 255)
+    bright, trip = _wire_brightness(wire)
+    cx = wire.cell[0] + 0.5
+    cz = wire.cell[1] + 0.5
+    y = wire.y
+    if trip:
+        c = (255, 80, 80, 255)
+    else:
+        c = (min(255, int(base[0] * bright)),
+             min(255, int(base[1] * bright)),
+             min(255, int(base[2] * bright)), 255)
+    dirs = _wire_conn_dirs(wire.cell, conn)
+    if not dirs:
+        # 孤立线头：小圆点，避免整格消失
+        draw((cx, y + 0.05, cz), 0.24, 0.07, 0.24, c)
+        return
+    has_x = "E" in dirs or "W" in dirs
+    has_z = "N" in dirs or "S" in dirs
+    if has_x:
+        # 东西向连续细条（半段由本格与邻格各自画出，格边相接）
+        draw((cx, y + 0.05, cz), 1.0, 0.06, 0.18, c)
+    if has_z:
+        # 南北向细条
+        draw((cx, y + 0.05, cz), 0.18, 0.06, 1.0, c)
+    # 中央节点（同色稍高，示意接线点）
+    draw((cx, y + 0.07, cz), 0.2, 0.06, 0.2, c)
+    # 开路端小墩：只在该方向没有连接时画，收口
+    if "E" not in dirs and has_x:
+        draw((cx + 0.44, y + 0.10, cz), 0.12, 0.16, 0.12, c)
+    if "W" not in dirs and has_x:
+        draw((cx - 0.44, y + 0.10, cz), 0.12, 0.16, 0.12, c)
+    if "S" not in dirs and has_z:
+        draw((cx, y + 0.10, cz + 0.44), 0.12, 0.16, 0.12, c)
+    if "N" not in dirs and has_z:
+        draw((cx, y + 0.10, cz - 0.44), 0.12, 0.16, 0.12, c)
+
+
+def _draw_wire_2d(wire, conn):
+    """2D 画一段电线（沿连接方向的分支条，开路端小方点）。"""
+    base = (*gamedata.WIRE_COLORS.get(wire.kind, (180, 180, 200)), 255)
+    bright, trip = _wire_brightness(wire)
+    cx = wire.cell[0] + 0.5
+    cz = wire.cell[1] + 0.5
+    if trip:
+        c = (255, 80, 80, 255)
+    else:
+        c = (min(255, int(base[0] * bright)),
+             min(255, int(base[1] * bright)),
+             min(255, int(base[2] * bright)), 255)
+    dirs = _wire_conn_dirs(wire.cell, conn)
+    if not dirs:
+        draw_rect_v((cx - 0.12, cz - 0.12), (0.24, 0.24), c)
+        return
+    has_x = "E" in dirs or "W" in dirs
+    has_z = "N" in dirs or "S" in dirs
+    if has_x:
+        draw_rect_v((cx - 0.5, cz - 0.09), (1.0, 0.18), c)
+    if has_z:
+        draw_rect_v((cx - 0.09, cz - 0.5), (0.18, 1.0), c)
+    draw_rect_v((cx - 0.10, cz - 0.10), (0.20, 0.20), c)
+    if "E" not in dirs and has_x:
+        draw_rect_v((cx + 0.40, cz - 0.07), (0.12, 0.14), c)
+    if "W" not in dirs and has_x:
+        draw_rect_v((cx - 0.52, cz - 0.07), (0.12, 0.14), c)
+    if "S" not in dirs and has_z:
+        draw_rect_v((cx - 0.07, cz + 0.40), (0.14, 0.12), c)
+    if "N" not in dirs and has_z:
+        draw_rect_v((cx - 0.07, cz - 0.52), (0.14, 0.12), c)
+
+
 class Renderer:
     def __init__(self):
         self.frame_count = 0
@@ -75,7 +261,6 @@ class Renderer:
         self._cull_m = None
         self._cull_tan_x = 0.0
         self._cull_tan_y = 0.0
-        self._frustum_culling = True
         self._visible_cache_key = None
         self._visible_cache = ()
         self._prop_material = None
@@ -89,8 +274,8 @@ class Renderer:
         # 2D 道具绘制数据：按区块缓存，避免每帧重复读属性/拼颜色。
         self._2d_prop_cache = OrderedDict()
         self._2d_prop_cache_max = 512
-        self._2d_path_cache = []        # 2D      
-        self._2d_path_key = None        # 2D          key
+        self._2d_path_cache = []        # 2D 路径叠加缓存：色块列表（键为 _2d_path_key）
+        self._2d_path_key = None        # 2D 路径缓存键：路径版本/类型色
         self._2d_layer_tex = None
         self._2d_layer_key = None
         self._2d_last_key = None
@@ -101,8 +286,6 @@ class Renderer:
             0.0, 0.0, 1.0, 0.0,
             0.0, 0.0, 0.0, 1.0,
         )
-        self._block_color_cache = {}
-        self._block_def_cache = {}
         self._entity_color_cache = {}
         self._pickup_color_cache = {}
         self._solid_lut = np.zeros(256, dtype=bool)
@@ -210,10 +393,6 @@ class Renderer:
         self._cull_far = max(float(self._fog_far_cur), view_dist)
         self._cull_chunk_radius = int(
             math.ceil(self._cull_far / config.CHUNK_SIZE)) + 2
-        if not self._frustum_culling:
-            self._cull_view = None
-            self._cull_m = None
-            return
 
         self._cull_view = rl.GetCameraMatrix(cam3d)
         m = self._cull_view
@@ -275,7 +454,7 @@ class Renderer:
     def _visible_chunks_3d(self, universe, camera):
         cam3d = camera.get_camera3d()
         cache_key = (cam3d, rl.GetScreenWidth(), rl.GetScreenHeight(),
-                     self._cull_far, self._cull_near, self._frustum_culling)
+                     self._cull_far, self._cull_near)
         if cache_key == self._visible_cache_key:
             return self._visible_cache
 
@@ -358,8 +537,9 @@ class Renderer:
             n = len(props)
             entry = self._prop_meshes.get(key)
             if entry is not None and entry["props"] is props and entry["n"] == n:
-                rl.DrawMesh(entry["mesh"][0], material,
-                            self._IDENTITY_MATRIX)
+                if entry.get("mesh") is not None:
+                    rl.DrawMesh(entry["mesh"][0], material,
+                                self._IDENTITY_MATRIX)
                 self._prop_meshes.move_to_end(key)
                 continue
             self._build_prop_mesh(key, props, material)
@@ -382,7 +562,8 @@ class Renderer:
 
     @staticmethod
     def _emit_cube(positions, colors, x, y, z, w, h, d, c):
-        """输出居中方块的 6 个面顶点；面片顺序/缠绕与 _build_chunk_mesh 的 add_face 一致（外法线朝外）"""
+        """输出居中方块的 6 个面顶点；面片顺序/缠绕保证外法线朝外
+        （与块网格面片规则一致）。"""
         x0, x1 = x - w * 0.5, x + w * 0.5
         y0, y1 = y - h * 0.5, y + h * 0.5
         z0, z1 = z - d * 0.5, z + d * 0.5
@@ -399,7 +580,7 @@ class Renderer:
         colors.extend(c * 36)
 
     def _emit_prop_3d(self, prop, positions, colors):
-        """把单个道具的几何写入顶点缓冲（几何/颜色与原 _draw_prop_3d 完全一致）"""
+        """把单个道具的几何写入顶点缓冲（几何/颜色与旧的逐道具绘制实现一致）"""
         shape = prop.prop_type.shape
         x, y, z = prop.x + 0.5, prop.y, prop.z + 0.5
         s = prop.size
@@ -548,7 +729,14 @@ class Renderer:
 
     @classmethod
     def _prop_geometry(cls, cubes):
-        """向量化生成道具顶点/颜色缓冲（与逐顶点 _emit_cube 字节一致）。"""
+        """向量化生成道具顶点/颜色缓冲（与逐顶点 _emit_cube 字节一致）。
+
+        空输入返回空缓冲（R2-F4：原实现对 [] 抛 IndexError——生产路径
+        _build_prop_mesh 有空哨兵守卫兜住，但函数本体应保持全函数语义）。
+        """
+        if not cubes:
+            return (np.array([], dtype=np.float32),
+                    np.array([], dtype=np.uint8))
         geom = np.array([c[:6] for c in cubes], dtype=np.float64)
         cols = np.array([c[6] for c in cubes], dtype=np.uint8)
         x0 = geom[:, 0] - geom[:, 3] * 0.5
@@ -570,7 +758,8 @@ class Renderer:
     def _build_prop_mesh(self, key, props, material):
         """把整个区块的道具烘成单个网格（仅在道具数量变化时重建）"""
         old = self._prop_meshes.pop(key, None)
-        if old is not None:
+        if old is not None and old.get("mesh") is not None:
+            # 空哨兵条目 mesh=None（道具全采空），不能下标访问（BUG-004）
             rl.UnloadMesh(old["mesh"][0])
 
         cubes = []
@@ -580,6 +769,10 @@ class Renderer:
             self._prop_cubes(prop, cubes)
 
         if not cubes:
+            # 区块道具已全部采空：写空缓存条目（mesh=None），
+            # 避免每帧重复 pop/unload/重建尝试。
+            self._prop_meshes[key] = {"mesh": None, "props": props,
+                                      "n": len(props), "bounds": None}
             return
 
         positions, colors = self._prop_geometry(cubes)
@@ -616,7 +809,7 @@ class Renderer:
 
     def _unload_prop_mesh(self, key):
         entry = self._prop_meshes.pop(key, None)
-        if entry:
+        if entry and entry.get("mesh") is not None:
             rl.UnloadMesh(entry["mesh"][0])
 
     def mark_chunks_dirty(self, keys):
@@ -1141,8 +1334,17 @@ class Renderer:
         if self._shared_material is not None:
             rl.UnloadMaterial(self._shared_material)
             self._shared_material = None
-            # raylib 6 的 UnloadMaterial 会一并释放材质引用的 shader；
-            # 这里清空引用，避免 unload() 再次 UnloadShader 造成 double free。
+            # 注意：stock raylib 的 UnloadMaterial 只释放材质自带的 shader（此处即
+            # _fog_shader，见 _get_shared_material 的 material.shader 赋值）和 maps
+            # 数组，并不释放 maps[0] 引用的纹理。因此：
+            #   · 纹理不是双重释放——下面的显式 UnloadTexture 是它唯一的一次释放；
+            #   · 雾着色器已随 UnloadMaterial 内部 UnloadShader 释放，这里只需把
+            #     _fog_shader 置 None，避免 unload()/init_3d() 的守卫再次 UnloadShader
+            #     同一 id（二次释放 GPU shader）。绝不能再显式 UnloadShader 一次。
+            self._fog_shader = None
+        elif self._fog_shader is not None:
+            # 兜底：材质未建成但雾着色器已建（异常路径），此时无人释放它，显式卸载。
+            rl.UnloadShader(self._fog_shader)
             self._fog_shader = None
         if self._shared_texture is not None:
             rl.UnloadTexture(self._shared_texture)
@@ -1160,32 +1362,6 @@ class Renderer:
             rl.UnloadImage(self._prop_image)
             self._prop_image = None
 
-    def _get_block_def(self, block_id):
-        block_def = self._block_def_cache.get(block_id)
-        if block_def is None:
-            block_def = get_block(block_id)
-            self._block_def_cache[block_id] = block_def
-        return block_def
-
-    def _get_block_colors(self, block_id, block_def):
-        """Cache block colors per ID"""
-        colors = self._block_color_cache.get(block_id)
-        if colors is None:
-            if block_def.transparent:
-                colors = (
-                    (*block_def.top_color, 179),
-                    (*block_def.side_color, 179),
-                    (*block_def.bottom_color, 179),
-                )
-            else:
-                colors = (
-                    (*block_def.top_color, 255),
-                    (*block_def.side_color, 255),
-                    (*block_def.bottom_color, 255),
-                )
-            self._block_color_cache[block_id] = colors
-        return colors
-
     def _get_entity_color(self, palette, key, fallback):
         cache = self._entity_color_cache
         color = cache.get(key)
@@ -1198,8 +1374,12 @@ class Renderer:
         """ """
         bx = universe.base_x + 0.5
         bz = universe.base_z + 0.5
-        # get_surface_height 返回地表方块的 y 索引，+1 才是方块顶面（世界坐标基准）
-        base_y = universe.get_surface_height(universe.base_x, universe.base_z) + 1
+        # 锚点必须用纯生成高度：get_surface_height 会读 chunk.surface_height，
+        # 而该数组被敌人挖掘（dig_front_block/mark_passage）改写——敌人挖穿
+        # 基地列时 base_y 骤降，整个大本营会沉进台地里"消失"（种子 3091 实证）。
+        # _surface_height_pure = 纯噪声+基地平整，与 chunk 生成值一致且免疫 override。
+        # 返回地表方块的 y 索引，+1 才是方块顶面（世界坐标基准）
+        base_y = universe._surface_height_pure(universe.base_x, universe.base_z) + 1
 
         # 主塔身（2.2 那次注释改写时连代码一起被删，导致塔身"看不到了"，在此恢复）
         draw_cube((bx, base_y + 2.0, bz), 2.0, 4.0, 2.0, (180, 160, 140, 255))
@@ -1237,12 +1417,150 @@ class Renderer:
         for tower in entities.get("towers", ()):
             tc = tower.display_color
             pos = tower.position
+            # 塔身主箱体几何与放置预览/拆除高亮共享（TowerType.body_dims），
+            # 改造型只改那一处，避免预览与实塔错位
+            sc = getattr(tower, "storage_capacity", 0)
+            pc = getattr(tower, "processing_capacity", 0)
+            if getattr(tower, "is_mining", False):
+                bw, bh, bd, by = tower.type_def.body_dims(tower.footprint)
+            else:
+                bw, bh, bd, by = tower.type_def.body_dims()
+            # 开采塔：足迹平台 + 中央井架 + 竖井井口 + 深度/容量条
+            if getattr(tower, "is_mining", False):
+                draw((pos[0], pos[1] + by, pos[2]), bw, bh, bd, tc)
+                # 塔身顶面 y 与半宽/半深（随足迹缩放，井口/深度条/挂架据此定位，
+                # 否则按 1x1 写死的偏移会落进塔身立方内被遮挡——BUG-064）
+                _top = pos[1] + by + bh / 2
+                _hw = bw / 2
+                _hd = bd / 2
+                # 顶盖亮一号色（中心井架）
+                lid_y = by + bh / 2 + 0.06
+                lc = getattr(tower, "_mining_lid_color", None)
+                if lc is None or lc[1] is not tc:
+                    lc = ((min(255, tc[0] + 35), min(255, tc[1] + 35),
+                           min(255, tc[2] + 35), 255), tc)
+                    tower._mining_lid_color = lc
+                draw((pos[0], pos[1] + lid_y, pos[2]), 0.5, 0.5, 0.5, lc[0])
+                # 井架柱（四角 + 中柱），示意"竖井向下采"
+                for dx, dz in ((-0.35, -0.35), (0.35, -0.35), (-0.35, 0.35), (0.35, 0.35)):
+                    draw((pos[0] + dx, pos[1] + 1.4, pos[2] + dz), 0.08, 1.2, 0.08,
+                         (min(255, tc[0] + 60), min(255, tc[1] + 60),
+                          min(255, tc[2] + 60), 255))
+                # 竖井井口：顶面中央凹洞示意（抬到塔身顶面，尺寸随足迹缩放）
+                _mw = max(0.6, bw * 0.35)
+                _md = max(0.6, bd * 0.35)
+                draw((pos[0], _top + 0.03, pos[2]), _mw, 0.06, _md, (30, 30, 34, 255))
+                # 开采深度条：塔角细柱，高度 ∝ 当前开采进度（相对 mine_range）
+                _mr = float(getattr(tower.type_def, "mining_attr", lambda k, d=0: d)("mine_range", 24) or 24)
+                _depths = []
+                for (_x, _z), _col in getattr(tower, "mine_shaft", {}).items():
+                    _st = tower.mine_start_surface.get((_x, _z))
+                    if _st is None:
+                        continue
+                    _depths.append(max(0.0, _st - (_col["front"] if _col["front"] is not None else _st)))
+                _frac = min(1.0, (max(_depths) / _mr) if _depths else 0.0)
+                if _frac > 0.0:
+                    h = max(0.08, 0.9 * _frac)
+                    # 深度条立在塔身顶面之上（底面 = _top），角点偏移随足迹缩放
+                    draw((pos[0] + _hw * 0.8, _top + h * 0.5, pos[2] + _hd * 0.8),
+                         0.1, h, 0.1, (120, 200, 255, 255))
+                # 挂载武器标记：抬到塔身顶面上方，横向偏移随足迹缩放
+                for _mi, _m in enumerate(getattr(tower, "weapon_mounts", ())):
+                    _wc = _m["wdef"].color
+                    draw((pos[0] - _hw * 0.8, _top + 0.18 + _mi * 0.26, pos[2]),
+                         0.12, 0.14, 0.30, (_wc[0], _wc[1], _wc[2], 255))
+            # 仓储塔/加工塔：矮木箱造型 + 侧壁容量条（绿→黄→红按占用比）
+            elif sc or pc:
+                cap = sc or pc
+                used = tower.storage_used() if sc else tower.processing_used()
+                draw((pos[0], pos[1] + by, pos[2]), bw, bh, bd, tc)
+                # 顶盖亮一号色（颜色缓存模式同垛口）；顶盖贴在塔身顶面
+                # （body_dims 中 by 为中心抬升、bh 为塔身高 → 顶面 = by + bh/2）
+                lid_y = by + bh / 2 + 0.06
+                lc = getattr(tower, "_storage_lid_color", None)
+                if lc is None or lc[1] is not tc:
+                    lc = ((min(255, tc[0] + 35), min(255, tc[1] + 35),
+                           min(255, tc[2] + 35), 255), tc)
+                    tower._storage_lid_color = lc
+                draw((pos[0], pos[1] + lid_y, pos[2]), 0.7, 0.12, 0.7, lc[0])
+                # 研究塔：顶部"学识"亮点 + 侧边学识等级柱
+                if getattr(tower, "is_research", False):
+                    rc = getattr(tower, "_research_gem_color", None)
+                    if rc is None or rc[1] is not tc:
+                        rc = ((min(255, tc[0] + 70), min(255, tc[1] + 60),
+                               min(255, tc[2] + 65), 255), tc)
+                        tower._research_gem_color = rc
+                    draw((pos[0], pos[1] + lid_y + 0.30, pos[2]), 0.28, 0.28, 0.28, rc[0])
+                    # 学识等级柱：高度 ∝ 当前学识属性（Lv1 短柱 → Lv3 高柱）
+                    attr = tower.research_attribute()
+                    pips = max(1, attr)
+                    pip_h = 0.10
+                    base_y = pos[1] + 0.12
+                    for i in range(pips):
+                        draw((pos[0] - 0.45, base_y + i * (pip_h + 0.04), pos[2] - 0.45),
+                             0.08, pip_h, 0.08, (200, 180, 255, 255))
+                # 容量竖条：塔角细柱，高度 ∝ 已用空间
+                ratio = used / cap
+                if ratio > 0.0:
+                    h = max(0.08, 0.9 * ratio)
+                    if ratio >= 1.0:
+                        fc = (255, 120, 100, 255)
+                    elif ratio >= 0.75:
+                        fc = (255, 200, 100, 255)
+                    else:
+                        fc = (120, 220, 120, 255)
+                    draw((pos[0] + 0.45, pos[1] + 0.15 + h * 0.5, pos[2] + 0.45),
+                         0.1, h, 0.1, fc)
+                # 加工塔在制进度竖条：另一侧塔角细柱，高度 ∝ 最近任务进度
+                if pc and tower.process_jobs:
+                    rkey, elapsed = max(tower.process_jobs.items(), key=lambda kv: kv[1])
+                    dur = tower.process_duration(rkey)
+                    pr = min(1.0, elapsed / dur) if dur > 0 else 1.0
+                    h = max(0.08, 0.9 * pr)
+                    draw((pos[0] - 0.45, pos[1] + 0.15 + h * 0.5, pos[2] + 0.45),
+                         0.1, h, 0.1, (255, 190, 90, 255))
+                # 挂载武器标记（与城墙一致，位置适配矮箱）
+                for _mi, _m in enumerate(getattr(tower, "weapon_mounts", ())):
+                    _wc = _m["wdef"].color
+                    draw((pos[0] - 0.36, pos[1] + 0.9 + _mi * 0.26, pos[2]),
+                         0.12, 0.14, 0.30, (_wc[0], _wc[1], _wc[2], 255))
+            # 电力塔（电站/电池）：本体 + 彩色顶盖 + 电池储能条/电站出力指示
+            elif getattr(tower, "is_power", False):
+                draw((pos[0], pos[1] + by, pos[2]), bw, bh, bd, tc)
+                _pk = getattr(tower, "power_kind", "")
+                _lid_y = by + bh / 2 + 0.05
+                if _pk == "battery":
+                    # 储能条（绿→黄→红）
+                    cap = max(1e-6, float(getattr(tower, "cell_energy_j", 1.0)))
+                    frac = min(1.0, float(getattr(tower, "charge_j", 0.0)) / cap)
+                    if frac >= 0.75:
+                        _fc = (110, 220, 120, 255)
+                    elif frac >= 0.35:
+                        _fc = (255, 200, 100, 255)
+                    else:
+                        _fc = (255, 120, 100, 255)
+                    h = max(0.10, 0.85 * frac) if frac > 0 else 0.05
+                    draw((pos[0] + 0.42, pos[1] + 0.12 + h * 0.5, pos[2] + 0.42),
+                         0.10, h, 0.10, _fc)
+                    # 顶盖略暗（电池深色外壳）
+                    draw((pos[0], pos[1] + _lid_y, pos[2]), 0.62, 0.10, 0.62,
+                         (70, 90, 70, 255))
+                else:
+                    # 电站：顶盖亮色 + 出力时顶部指示灯
+                    _g = float(getattr(tower, "generation_w", 0.0))
+                    _glow = (min(255, int(90 + _g * 0.4)), 255, 140, 255) if _g > 0 \
+                        else (120, 130, 140, 255)
+                    draw((pos[0], pos[1] + _lid_y, pos[2]), 0.62, 0.10, 0.62, _glow)
+                    # 燃料缺省/欠载提示点
+                    if not _g and getattr(tower, "fuel_types", None):
+                        draw((pos[0], pos[1] + _lid_y + 0.28, pos[2]),
+                             0.16, 0.16, 0.16, (255, 150, 80, 255))
             # 防御塔（城墙）更高更粗，与攻击塔在视觉上明显区分
-            if getattr(tower, "no_attack", False):
-                draw((pos[0], pos[1] + 1.1, pos[2]), 0.6, 2.2, 0.6, tc)
+            elif getattr(tower, "no_attack", False):
+                draw((pos[0], pos[1] + by, pos[2]), bw, bh, bd, tc)
                 # 顶端垛口示意（垛口色按塔缓存：颜色只依赖塔本色）
                 bc = getattr(tower, "_battlement_color", None)
-                if bc is None or bc[0] is not tc:
+                if bc is None or bc[1] is not tc:
                     bc = ((min(255, tc[0] + 30), min(255, tc[1] + 30),
                            min(255, tc[2] + 30), 255), tc)
                     tower._battlement_color = bc
@@ -1253,16 +1571,58 @@ class Renderer:
                     draw((pos[0] - 0.36, pos[1] + 1.0 + _mi * 0.26, pos[2]),
                          0.12, 0.14, 0.30, (_wc[0], _wc[1], _wc[2], 255))
             else:
-                draw((pos[0], pos[1], pos[2]), 0.5, 1.0, 0.5, tc)
-            # 塔体血条（受损时显示）
+                draw((pos[0], pos[1] + by, pos[2]), bw, bh, bd, tc)
+            # 塔体血条（受损时显示；仓储/加工塔矮箱 → 更低位）
             if tower.hp < tower.max_hp:
                 bar_w = 0.7
                 bar_h = 0.08
-                bar_y = pos[1] + (2.5 if getattr(tower, "no_attack", False) else 0.8)
+                # 开采塔须先于仓储/加工判定：开采塔 storage_capacity=40，
+                # 否则永远落进仓储分支、血条埋进塔身（BUG-102）。
+                if getattr(tower, "is_mining", False):
+                    # 开采塔血条抬到顶盖之上（R2-D3）：原 bar_y=pos+体高+0.18
+                    # 落进顶盖立方内部——顶盖（0.5³）从顶面延伸到顶面+0.31，
+                    # 半宽 0.25 盖住 0.7 宽血条的中段 71%。bar_y = 顶面
+                    # （by+bh/2）+ 顶盖厚 0.31 + 0.18。
+                    _b = tower.type_def.body_dims(tower.footprint)
+                    bar_y = pos[1] + _b[3] + _b[1] / 2 + 0.31 + 0.18
+                elif getattr(tower, "storage_capacity", 0) \
+                        or getattr(tower, "processing_capacity", 0):
+                    if getattr(tower, "is_research", False):
+                        # 研究塔血条抬到塔身顶面上方（R4-K5：原 bar_y=pos+0.8+
+                        # 1.6+0.18 把 y_off 与体高重复累加，悬浮在塔体上方约 0.8
+                        # 格；与开采/电力塔一致取"顶面（by+bh/2）+0.18"）。
+                        _b = tower.type_def.body_dims(tower.footprint)
+                        bar_y = pos[1] + _b[3] + _b[1] / 2 + 0.18
+                    else:
+                        bar_y = pos[1] + 1.35
+                else:
+                    if getattr(tower, "no_attack", False):
+                        bar_y = pos[1] + 2.5
+                    else:
+                        # 电力塔体高 body_dims().h=1.2，按实际体高抬到
+                        # 顶面上方（[3] 是 y_off 不是体高，BUG-101）
+                        _h = tower.type_def.body_dims(tower.footprint)[1]
+                        bar_y = pos[1] + _h + 0.18
                 draw((pos[0], bar_y, pos[2]), bar_w, bar_h, 0.05, health_bg_color)
                 hp_ratio = max(0.0, tower.hp / tower.max_hp)
                 draw((pos[0] - bar_w * (1.0 - hp_ratio) * 0.5, bar_y, pos[2]),
                      bar_w * hp_ratio, bar_h, 0.05, health_fg)
+
+        # ── 传送带（物流）：低扁盒 + 方向箭头 + 带内货物小方块 ──
+        mat_color = MATERIAL_COLORS.get
+        for belt in entities.get("belts", ()):
+            _draw_belt_3d(draw, belt, mat_color, gamedata.BELT_COLORS)
+
+        # ── 电线（输电）：沿连接方向的细扁条，按电流亮度/跳闸红 ──
+        wire_list = entities.get("wires", ())
+        if wire_list:
+            # 连接格集合 = 全部电线格 + 电站/电池格（线头贴到建筑边）
+            wire_conn = {w.cell for w in wire_list}
+            for _t in entities.get("towers", ()):
+                if getattr(_t, "is_power", False):
+                    wire_conn.add((int(_t.position[0]), int(_t.position[2])))
+            for wire in wire_list:
+                _draw_wire_3d(draw, wire, wire_conn)
 
         for enemy in entities.get("enemies", ()):
             if enemy.behavior in ("scout_wander", "scout_return"):
@@ -1278,12 +1638,14 @@ class Renderer:
             # Health bar above enemy
             bar_w = 0.6
             bar_h = 0.08
-            bar_x = pos[0] - bar_w / 2
             bar_y = pos[1] + 0.5
             bar_z = pos[2]
-            draw((bar_x, bar_y, bar_z), bar_w, bar_h, 0.05, health_bg_color)
+            # DrawCube 以中心定位：背景居中于敌人（pos[0]±bar_w/2），
+            # 前景左对齐、从左向右递减（与 3D 塔体血条一致，BUG-066）
+            draw((pos[0], bar_y, bar_z), bar_w, bar_h, 0.05, health_bg_color)
             hp_ratio = enemy.health / enemy.max_health
-            draw((bar_x, bar_y, bar_z), bar_w * hp_ratio, bar_h, 0.05, health_color)
+            draw((pos[0] - bar_w * (1.0 - hp_ratio) * 0.5, bar_y, bar_z),
+                 bar_w * hp_ratio, bar_h, 0.05, health_color)
 
         for proj in entities.get("projectiles", ()):
             if proj.active:
@@ -1302,7 +1664,10 @@ class Renderer:
         }
         for rt, sp in spawners:
             cx, cz = sp.x + 0.5, sp.z + 0.5
-            cy = sp.surface_y + 1
+            # R8-Q1：标记高度用实时 surface_height_at（覆盖层感知），否则
+            # 材料化后该处被挖低/垫高时 3D 标记永久浮空/被埋（surface_y 是
+            # 材料化时的冻结快照）。
+            cy = universe.surface_height_at(sp.x, sp.z) + 1
             c = mode_colors.get(rt.mode, (120, 120, 120, 200))
             # 底座方块
             draw_cube((cx, cy, cz), 0.8, 0.1, 0.8, c)
@@ -1358,7 +1723,7 @@ class Renderer:
         """把单个路径烘成静态网格。
 
         路径点已带表面锚定 y（= 地表方块顶面 +1），段内位置/高度线性插值，
-        不再逐点重算 fbm 地形（原 _build_path_mesh 每个路径点重算一次地形，
+        不再逐点重算 fbm 地形（旧实现 _build_path_mesh——已删——每个路径点重算一次地形，
         全量重建时随总路径点线性恶化，是游戏后期单帧 1-2 秒卡死的根因）。
         color: 路径带颜色（按敌人类型淡染）。
         """
@@ -1375,8 +1740,11 @@ class Renderer:
             dx = x2 - x1
             dz = z2 - z1
             seg_len = math.sqrt(dx * dx + dz * dz)
-            steps = max(1, int(seg_len))
-            for s in range(steps):
+            # 步数保证相邻采样间距 ≤ 0.9（四边形宽 0.9），且采样含端点 t=1：
+            # 原实现 range(steps) 采样 [0,1) 漏掉 t=1，对角长段在段间留下
+            # spacing-0.9 的断裂缝（对角路径最明显）。
+            steps = max(1, int(math.ceil(seg_len / 0.9)))
+            for s in range(steps + 1):
                 t = s / steps
                 # 路径点已是世界坐标（方块中心），x/z 不再 +0.5；
                 # y 线性插值保持连续，再抬 0.05 避免贴地 z-fighting
@@ -1420,14 +1788,19 @@ class Renderer:
         return mesh_arr, self._mesh_bounds(positions)
 
     @staticmethod
-    def _path_color_for(key):
-        """路径带颜色：主变体 = 类型色与路径色 50% 混合；备用变体更灰。"""
+    def _path_color_for(key, opacity=1.0):
+        """路径带颜色：主变体 = 类型色与路径色 50% 混合；备用变体更灰。
+
+        opacity（0..1）来自玩家设置 route_opacity，缩放 alpha 通道；
+        改变该值会使已烘焙网格失效（见 _sync_path_meshes 的透明度对比），
+        逐路径重新烘焙出新的顶点色。
+        """
         _, type_name, idx = key
         base = gamedata.ENEMY_COLORS.get(type_name, (200, 50, 50))
         mix = 0.5 if idx == 0 else 0.22
         tan = (180, 160, 120)
         blend = tuple(int(t * (1 - mix) + b * mix) for t, b in zip(tan, base))
-        return (*blend, 255)
+        return (*blend, int(round(255 * max(0.0, min(1.0, opacity)))))
 
     def _desired_paths(self, universe, entities):
         """当前应渲染的路径集 {(sid, type_name, idx): PathData}。"""
@@ -1439,39 +1812,82 @@ class Renderer:
         return {("legacy", sid, 0): pd
                 for sid, pd in universe.enemy_paths.items()}
 
+    def _route_opacity(self, entities):
+        """当前路线透明度（0..1），来自玩家设置；无 game 时取 1。"""
+        game = entities.get("game") if entities else None
+        val = getattr(game, "settings", {}).get("route_opacity", 1.0)
+        try:
+            return max(0.0, min(1.0, float(val)))
+        except (TypeError, ValueError):
+            return 1.0
+
+    def _routes_visible(self, entities):
+        """主视图进攻路线是否显示（玩家设置 show_attack_routes）。"""
+        game = entities.get("game") if entities else None
+        return bool(getattr(game, "settings", {}).get("show_attack_routes", True))
+
     def _sync_path_meshes(self, universe, entities=None):
         """增量同步路径网格：只烘焙新增/失效路径，逐路径缓存。
 
         失效判定用 PathData 对象同一性（重路由会产生新 PathData 对象）。
+        路线透明度变化时整体失效重烘焙（alpha 烘在顶点色里）。
         """
+        if not self._routes_visible(entities):
+            # 关闭时不卸载网格（避免反复开关抖动重建），仅不绘制；
+            # 但要记录当前透明度，重新打开时若已变化会触发重烘焙。
+            self._path_opacity_last = self._route_opacity(entities)
+            return
+        opacity = self._route_opacity(entities)
+        force = (opacity != getattr(self, "_path_opacity_last", opacity))
+        self._path_opacity_last = opacity
         desired = self._desired_paths(universe, entities)
         meshes = self._path_meshes
+        if force:
+            for key in list(meshes):
+                entry = meshes.pop(key)
+                if entry[0] is not None:
+                    rl.UnloadMesh(entry[0][0])
         for key in list(meshes):
             if key not in desired or desired[key] is not meshes[key][2]:
-                rl.UnloadMesh(meshes.pop(key)[0][0])
+                entry = meshes.pop(key)
+                if entry[0] is not None:
+                    rl.UnloadMesh(entry[0][0])
         baked = 0
         for key, pd in desired.items():
             entry = meshes.get(key)
             if entry is not None and entry[2] is pd:
                 continue
-            m = self._build_single_path_mesh(pd, self._path_color_for(key))
+            m = self._build_single_path_mesh(pd, self._path_color_for(key, opacity))
             if m is not None:
                 meshes[key] = (m[0], m[1], pd)
+            else:
+                # 退化路径（<2 点）无法烘焙：缓存哨兵 (None,None,pd)，
+                # 避免每帧重试并占用烘焙预算（原实现每次 bake 失败仍
+                # baked += 1，少量退化路径可吃满每帧 24 的预算）。
+                meshes[key] = (None, None, pd)
             baked += 1
             if baked >= 24:
                 break
 
     def _render_path_3d(self, universe, entities=None):
-        """逐路径网格绘制（增量缓存，路径数变化不卡帧）"""
+        """逐路径网格绘制（增量缓存，路径数变化不卡帧）。
+
+        受玩家设置 show_attack_routes 控制；关闭时不绘制主视图路线带
+        （与小地图路线叠加相互独立）。
+        """
+        if not self._routes_visible(entities):
+            return
         self._sync_path_meshes(universe, entities)
         material = self._get_shared_material()
         for entry in self._path_meshes.values():
-            rl.DrawMesh(entry[0][0], material, self._IDENTITY_MATRIX)
+            if entry[0] is not None:
+                rl.DrawMesh(entry[0][0], material, self._IDENTITY_MATRIX)
 
     def _unload_path_meshes(self):
         """卸载全部路径网格。"""
         for entry in list(self._path_meshes.values()):
-            rl.UnloadMesh(entry[0][0])
+            if entry[0] is not None:
+                rl.UnloadMesh(entry[0][0])
         self._path_meshes.clear()
         self._path_key = None
 
@@ -1783,6 +2199,14 @@ class Renderer:
             second[ok_second] = blocks[ix, iz, y2c][ok_second]
         ids = np.where(top != 0, top, second)
 
+        # #3 深洋柱三路不一致（渲染侧）：chunk.surface_height 对海洋柱存的是
+        # 海底高度（floor(altitude)），顶块是海底沙；2D 主视图若直接用它取色，
+        # 海洋会画成沙色，与 3D 视图（水块）、小地图（水色）不一致。海洋柱的
+        # "视觉表面"应是水面（sea_top 处的水块），故海洋列统一用水色顶面。
+        ocean_cols = getattr(chunk, "_ocean_cols", None)
+        if ocean_cols is not None and ocean_cols.any():
+            ids = np.where(ocean_cols, BLOCK_ID["water"], ids)
+
         lut = self._top_color_tuples
         # ids 以 [lx, lz] 排列；转成 [lz, lx] 后逐行做 run-length。
         flat_ids = ids.T.ravel().tolist()
@@ -1827,9 +2251,11 @@ class Renderer:
         cx = math.floor(camera.pos_2d[0])
         cz = math.floor(camera.pos_2d[2])
         x_min = math.floor(cx - half_w) - 1
-        x_max = math.floor(cx + half_w) + 1
         z_min = math.floor(cz - half_h) - 1
-        z_max = math.floor(cz + half_h) + 1
+        # 右/下缘用 ceil(相机真实中心 + 半宽) 向上取整再 +1，覆盖最右侧/最下侧
+        # 像素中心（floor 会少一格 → 屏幕边缘 1 像素天空条，BUG-067）
+        x_max = math.ceil(camera.pos_2d[0] + half_w) + 1
+        z_max = math.ceil(camera.pos_2d[2] + half_h) + 1
 
         cs = config.CHUNK_SIZE
         draw_rect = rl.DrawRectangleV
@@ -1863,21 +2289,38 @@ class Renderer:
                               (float(wx1 - wx0), float(wz1 - wz0)), run_color)
 
     def _render_path_2d(self, universe, entities=None):
-        """ """
+        """2D 路径带绘制。受 show_attack_routes 控制，透明度取 route_opacity。"""
+        if not self._routes_visible(entities):
+            return
+        opacity = self._route_opacity(entities)
         desired = self._desired_paths(universe, entities)
-        cache_key = frozenset((k, id(pd)) for k, pd in desired.items())
+        cache_key = (frozenset((k, id(pd)) for k, pd in desired.items()), opacity)
         if cache_key != self._2d_path_key:
             cached = []
             for key, pd in desired.items():
-                _, type_name, idx = key
-                base = gamedata.ENEMY_COLORS.get(type_name, (200, 50, 50))
-                mix = 0.55 if idx == 0 else 0.25
-                c = (int(255 * (1 - mix) + base[0] * mix),
-                     int(200 * (1 - mix) + base[1] * mix),
-                     int(50 * (1 - mix) + base[2] * mix), 102)
-                for x, y, z in pd.points:
+                # 与 3D _path_color_for 一致（tan 基色 + 类型色混合），
+                # alpha = 半透明基准 × 玩家路线透明度设置。
+                rgb = self._path_color_for(key)[:3]
+                a = int(round(102 * opacity))
+                c = (rgb[0], rgb[1], rgb[2], a)
+                pts = pd.points
+                for i in range(len(pts)):
+                    x1, _y1, z1 = pts[i]
                     # 0.4 宽格子，x/z 已是世界坐标（方块中心），故 -0.2 对齐
-                    cached.append(((x - 0.2, z - 0.2), c))
+                    cached.append(((x1 - 0.2, z1 - 0.2), c))
+                    # 平滑折线把长直段拉成两端点（pathfinding.smooth_cells），
+                    # 逐点画会只剩稀疏点阵；与 3D 侧一致按 <=0.4 间距插值，
+                    # 让相邻矩形连成连续路径带（BUG-103）。
+                    if i + 1 >= len(pts):
+                        continue
+                    x2, _y2, z2 = pts[i + 1]
+                    dist = math.hypot(x2 - x1, z2 - z1)
+                    steps = max(1, int(math.ceil(dist / 0.4)))
+                    for s in range(1, steps + 1):
+                        t = s / steps
+                        sx = x1 + (x2 - x1) * t
+                        sz = z1 + (z2 - z1) * t
+                        cached.append(((sx - 0.2, sz - 0.2), c))
             self._2d_path_cache = cached
             self._2d_path_key = cache_key
 
@@ -1898,8 +2341,97 @@ class Renderer:
         for tower in entities.get("towers", []):
             tc = tower.display_color
             pos = (tower.position[0], tower.position[2])
+            # 开采塔：按足迹画 2D 占地（R2-D4——原实现落入下方 sc/pc 仓储
+            # 分支画成 0.76 小箱，丢失 3×3+ 足迹且与仓储塔不可区分）。
+            if getattr(tower, "is_mining", False):
+                _fp = getattr(tower, "footprint", None)
+                m, n = (int(_fp[0]), int(_fp[1])) if _fp else (3, 3)
+                w2 = m * 0.5
+                h2 = n * 0.5
+                draw_rect_v((pos[0] - w2 + 0.06, pos[1] - h2 + 0.06),
+                            (w2 * 2 - 0.12, h2 * 2 - 0.12), tc)
+                # 中央井口标记（同 3D 顶盖凹洞语义）
+                draw_rect_v((pos[0] - 0.14, pos[1] - 0.14), (0.28, 0.28),
+                            (30, 30, 34, 255))
+                # 开采深度条：底部着色条高度 ∝ 当前进度（与 3D 深度条同口径）
+                _mr = float(getattr(tower.type_def, "mining_attr",
+                                    lambda k, d=0: d)("mine_range", 24) or 24)
+                _depths = []
+                for (_x, _z), _col in getattr(tower, "mine_shaft", {}).items():
+                    _st = tower.mine_start_surface.get((_x, _z))
+                    if _st is None:
+                        continue
+                    _depths.append(max(0.0, _st - (_col["front"] if _col["front"] is not None else _st)))
+                _frac = min(1.0, (max(_depths) / _mr) if _depths else 0.0)
+                if _frac > 0.0:
+                    fh = max(0.06, (h2 * 2 - 0.2) * _frac)
+                    draw_rect_v((pos[0] - w2 + 0.12, pos[1] + h2 - 0.12 - fh),
+                                (w2 * 2 - 0.24, fh), (120, 200, 255, 220))
+                # 挂载武器标记（与城墙一致，放足迹上方）
+                _mounts = getattr(tower, "weapon_mounts", ())
+                if _mounts:
+                    draw_rect_v((pos[0] - 0.30, pos[1] - h2 - 0.30),
+                                (0.60, 0.16), (20, 22, 30, 210))
+                    for _mi, _m in enumerate(_mounts[:3]):
+                        _wc = _m["wdef"].color
+                        draw_circle_v((pos[0] - 0.20 + _mi * 0.20,
+                                        pos[1] - h2 - 0.22), 0.06,
+                                       (_wc[0], _wc[1], _wc[2], 255))
+            # 仓储塔/加工塔：小方块 + 内部按占用比着色的填充条
+            sc = getattr(tower, "storage_capacity", 0)
+            pc = getattr(tower, "processing_capacity", 0)
+            if sc or pc:
+                cap = sc or pc
+                used = tower.storage_used() if sc else tower.processing_used()
+                w = 0.38
+                draw_rect_v((pos[0] - w, pos[1] - w), (w * 2, w * 2), tc)
+                ratio = used / cap
+                if ratio > 0.0:
+                    if ratio >= 1.0:
+                        fc = (255, 120, 100, 255)
+                    elif ratio >= 0.75:
+                        fc = (255, 200, 100, 255)
+                    else:
+                        fc = (120, 220, 120, 255)
+                    fh = (w * 2 - 0.1) * ratio
+                    draw_rect_v((pos[0] - w + 0.05, pos[1] + w - 0.05 - fh),
+                                (w * 2 - 0.1, fh), fc)
+                # 研究塔：顶心亮点标记（与仓储/加工塔区分）
+                if getattr(tower, "is_research", False):
+                    draw_rect_v((pos[0] - 0.08, pos[1] - 0.08), (0.16, 0.16),
+                                (230, 210, 255, 255))
+                # 挂载武器标记（与城墙一致）
+                _mounts = getattr(tower, "weapon_mounts", ())
+                if _mounts:
+                    draw_rect_v((pos[0] - 0.30, pos[1] - 0.70), (0.60, 0.16),
+                                (20, 22, 30, 210))
+                    for _mi, _m in enumerate(_mounts[:3]):
+                        _wc = _m["wdef"].color
+                        draw_circle_v((pos[0] - 0.20 + _mi * 0.20,
+                                        pos[1] - 0.62), 0.06,
+                                       (_wc[0], _wc[1], _wc[2], 255))
+            # 电力塔：方块 + 电池储能条/电站发电标记
+            elif getattr(tower, "is_power", False):
+                w = 0.45
+                draw_rect_v((pos[0] - w, pos[1] - w), (w * 2, w * 2), tc)
+                _pk = getattr(tower, "power_kind", "")
+                if _pk == "battery":
+                    cap = max(1e-6, float(getattr(tower, "cell_energy_j", 1.0)))
+                    frac = min(1.0, float(getattr(tower, "charge_j", 0.0)) / cap)
+                    if frac >= 0.75:
+                        _fc = (110, 220, 120, 255)
+                    elif frac >= 0.35:
+                        _fc = (255, 200, 100, 255)
+                    else:
+                        _fc = (255, 120, 100, 255)
+                    fh = (w * 2 - 0.08) * frac
+                    draw_rect_v((pos[0] - w + 0.04, pos[1] + w - 0.04 - fh),
+                                (w * 2 - 0.08, fh), _fc)
+                else:
+                    if float(getattr(tower, "generation_w", 0.0)) > 0:
+                        draw_circle_v((pos[0], pos[1]), 0.12, (150, 255, 170, 255))
             # 防御塔（城墙）画成方块；攻击塔画成圆点
-            if getattr(tower, "no_attack", False):
+            elif getattr(tower, "no_attack", False):
                 w = 0.45
                 draw_rect_v((pos[0] - w, pos[1] - w), (w * 2, w * 2), tc)
                 # 挂载武器标记：方块上方一条暗色底 + 武器本色小点，可数槽位
@@ -1923,6 +2455,19 @@ class Renderer:
                             health_bg_color)
                 draw_rect_v((pos[0] - bw / 2, by), (bw * hp_ratio, 0.08),
                             health_fg)
+
+        # ── 传送带（物流）：扁色块 + 方向箭头 + 带内货物小点 ──
+        _mc = MATERIAL_COLORS.get
+        for belt in entities.get("belts", []):
+            _draw_belt_2d(belt, _mc, gamedata.BELT_COLORS)
+        wire_list = entities.get("wires", [])
+        if wire_list:
+            wire_conn = {w.cell for w in wire_list}
+            for _t in entities.get("towers", []):
+                if getattr(_t, "is_power", False):
+                    wire_conn.add((int(_t.position[0]), int(_t.position[2])))
+            for wire in wire_list:
+                _draw_wire_2d(wire, wire_conn)
 
         for enemy in entities.get("enemies", []):
             if enemy.behavior in ("scout_wander", "scout_return"):
@@ -1977,7 +2522,12 @@ class Renderer:
             wind_dz = math.sin(universe.weather.wind_direction) * universe.weather.wind_strength
             for i in range(count // 4):
                 x = base_x + (i % 11 - 5) * 1.2 + wind_dx
-                y = ((i * 7.3 + self.frame_count * 0.7) % 15) + 5
+                # 3D 世界 +y 向上，帧数项取负使粒子随时间下落（BUG-068）。
+                # 高度带必须相对相机焦点（地表）而非绝对世界高度：陆地表典型
+                # 数百格高，旧的绝对带 [5,20) 使粒子埋在焦点正下方实心地形内
+                # （R2-D2）。以 camera.target[1]=地表+1 为基准向上铺 15 格。
+                y = (camera.target[1] + 4.0
+                     + ((i * 7.3 - self.frame_count * 0.7) % 15 + 15) % 15)
                 z = base_z + ((i * 3 + 2) % 11 - 5) * 1.2 + wind_dz
                 draw_cube((x, y, z), 0.02, 0.5, 0.02, rain_color)
         else:
@@ -1995,7 +2545,10 @@ class Renderer:
             wind_dz = math.sin(universe.weather.wind_direction) * universe.weather.wind_strength
             for i in range(count // 4):
                 x = base_x + (i % 7 - 3) * 2.0 + wind_dx * 0.8
-                y = ((i * 5.9 + self.frame_count * 0.4) % 15) + 5
+                # 3D 世界 +y 向上，帧数项取负使雪花随时间下落（BUG-068）。
+                # 高度带相对相机焦点（地表，见 _render_rain 的 R2-D2 说明）。
+                y = (camera.target[1] + 4.0
+                     + ((i * 5.9 - self.frame_count * 0.4) % 15 + 15) % 15)
                 z = base_z + ((i * 3 + 2) % 7 - 3) * 2.0 + wind_dz * 0.8
                 draw_cube((x, y, z), 0.1, 0.1, 0.1, snow_color)
         else:
@@ -2016,7 +2569,3 @@ class Renderer:
         self._2d_last_key = None
         self._2d_settle = 0
         self._2d_terrain_rev = 0
-        # 雾着色器：LoadShaderFromMemory 创建后从不释放，每次读档泄漏一个 GPU shader
-        if self._fog_shader is not None:
-            rl.UnloadShader(self._fog_shader)
-            self._fog_shader = None

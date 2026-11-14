@@ -114,15 +114,16 @@ class SeedScreen:
             self._update_save_browser()
             return
 
-        # 键盘
+        # 可打印字符：GetCharPressed 返回实际字符（保留大小写/Shift/大小写锁），
+        # 而 GetKeyPressed 对字母恒返回大写码点，chr() 会丢失小写，改变种子世界。
+        # 仍限制 ASCII 可打印（与原 32-126 行为一致）。
+        while (ch := rl.GetCharPressed()) > 0:
+            if 32 <= ch <= 126 and len(self.input_text) < MAX_SEED_LEN:
+                self.input_text += chr(ch)
+
+        # 特殊键（可打印字符已由 GetCharPressed 处理，这里跳过）
         while (key := rl.GetKeyPressed()) > 0:
-            # 可打印字符优先入框：否则 W/S/L 会被菜单快捷键吃掉，
-            # 含 w/s/l 的文字种子就打不出来。
             if 32 <= key <= 126:
-                if len(self.input_text) < MAX_SEED_LEN:
-                    # 保留原字符大小写：get_seed 按原文本 crc32，
-                    # 强制小写会改变混合大小写种子的世界，且无法复现。
-                    self.input_text += chr(key)
                 continue
             if key == rl.KEY_ENTER or key == rl.KEY_KP_ENTER:
                 self._activate_menu(self.menu_index)
@@ -146,15 +147,29 @@ class SeedScreen:
 
     def _update_save_browser(self):
         """存档浏览器输入处理。↑↓/W/S 选择, Enter 载入, Del 删除(二次确认), Esc 返回。"""
+        # 排空字符队列（BUG-010）：浏览存档时 update() 提前 return，不会走到
+        # 主循环的 GetCharPressed 排空；W/S 等按键产生的字符会滞留队列，
+        # Esc 返回种子界面后被一次性灌进种子框，污染种子改变世界。
+        while rl.GetCharPressed() > 0:
+            pass
         self._sync_visible_clamp()
 
         # 滚轮滚动
         wheel = rl.GetMouseWheelMove()
         if wheel and self.saved_items:
-            max_scroll = max(0, len(self.saved_items)
-                             - self._save_browser_metrics()[4])
+            visible = self._save_browser_metrics()[4]
+            n = len(self.saved_items)
+            max_scroll = max(0, n - visible)
+            old_scroll = self.save_scroll
             self.save_scroll = max(0, min(max_scroll,
                                           self.save_scroll - int(wheel)))
+            # 选中行跟随视口同向移动（修复 R1-A1）：原实现滚轮后无条件
+            # _clamp_scroll()，选中行位于视口边缘（初始 0/0 即如此）时滚动
+            # 被"保证选中行可见"立即弹回，纯滚轮浏览几乎失效。改为选中随
+            # 视口走，天然满足 BUG-046 的"选中行始终可见"不变式。
+            if self.save_scroll != old_scroll:
+                self.save_sel = max(0, min(
+                    n - 1, self.save_sel + (self.save_scroll - old_scroll)))
 
         while (key := rl.GetKeyPressed()) > 0:
             if key == rl.KEY_ESCAPE:
@@ -179,7 +194,7 @@ class SeedScreen:
                 self.confirm_delete_path = None
                 self._load_selected_save()
                 return
-            elif key == rl.KEY_DELETE or key == rl.KEY_BACK:
+            elif key == rl.KEY_DELETE or key == rl.KEY_BACKSPACE:
                 self._confirm_delete()
                 continue
 
@@ -215,6 +230,10 @@ class SeedScreen:
         if game:
             self.loaded_game = game
             self.starting = True
+        else:
+            # 加载失败（文件缺失/损坏/反序列化异常）不能静默吞掉（BUG-047），
+            # 明确报错并留在存档浏览器，让玩家知道这次加载没成功。
+            print(f"[错误] 加载失败: {os.path.basename(path)}")
 
     def _confirm_delete(self):
         """删除选中存档（需二次确认，与游戏内 F8 存档菜单一致）。"""
@@ -227,6 +246,9 @@ class SeedScreen:
                 print(f"[入口] 已删除: {os.path.basename(path)}")
                 self.saved_items = save_system.list_saves()
                 self._after_list_refresh()
+                # 删除后列表内容变化，旧行号可能指向另一存档，清掉双击配对（BUG-048）
+                self._last_click_row = -1
+                self._last_click_time = -1.0
         else:
             self.confirm_delete_path = self.saved_items[self.save_sel]["path"]
 
@@ -279,7 +301,11 @@ class SeedScreen:
         """
         mx, my = rl.GetMouseX(), rl.GetMouseY()
         now = rl.GetTime()
-        for i in range(len(self.saved_items)):
+        _base, _row_h, _row_step, _hint_y, visible = self._save_browser_metrics()
+        # 只命中视窗内可见行（滚动窗口外的行不可见也不可点，
+        # 否则点空白区会选中视窗外的行，与渲染路径不一致）
+        for i in range(self.save_scroll,
+                       min(len(self.saved_items), self.save_scroll + visible)):
             rx, ry, rw, rh = self._save_row_rect(i)
             if rx <= mx <= rx + rw and ry <= my <= ry + rh:
                 if rl.IsMouseButtonPressed(rl.MOUSE_BUTTON_LEFT):
@@ -296,6 +322,11 @@ class SeedScreen:
                         self._last_click_time = now
                         self._last_click_row = i
                 return
+        # 点击落在可见行之外（空白区）：清掉双击配对（BUG-049），
+        # 否则"点行→点空白→再点同行"会被误判为双击而意外载入。
+        if rl.IsMouseButtonPressed(rl.MOUSE_BUTTON_LEFT):
+            self._last_click_row = -1
+            self._last_click_time = -1.0
 
     # ── 绘制 ──
 
@@ -403,11 +434,12 @@ class SeedScreen:
     def get_seed(self):
         if not self.input_text:
             return config.DEFAULT_SEED
-        try:
+        # 仅纯 ASCII 数字串作为数字种子；负数、带空白/符号/字母走 crc32，
+        # 避免负种子直接传给 Universe，且 " 42 " 这类带空格输入被 int() 静默截断。
+        if self.input_text.isascii() and self.input_text.isdigit():
             return int(self.input_text)
-        except ValueError:
-            import zlib
-            return zlib.crc32(self.input_text.encode("utf-8")) & 0xFFFFFFFF
+        import zlib
+        return zlib.crc32(self.input_text.encode("utf-8")) & 0xFFFFFFFF
 
     def is_ready(self):
         return self.starting
@@ -456,10 +488,19 @@ def parse_cli_args(argv):
         if len(argv) > 2:
             raise ValueError(f"--load 只接受一个存档路径，多余: {' '.join(argv[2:])}")
         return ("load", argv[1])
-    try:
-        seed = int(argv[0])
-    except ValueError as e:
-        raise ValueError(f"种子必须是整数: {argv[0]!r}") from e
+    # CLI 种子与种子框 get_seed() 用同一判定（BUG-050）：仅纯 ASCII 数字串走
+    # int()，其余（负号/空白/符号/字母）走 crc32。否则 "python main.py -42" 得到
+    # int 种子 -42，而在种子框输入 "-42" 走 crc32 → 同串不同世界。
+    arg = argv[0]
+    # 空串种子 == 种子框空输入 == DEFAULT_SEED（BUG-121）：否则 '' 走 crc32
+    # 得到 0，而种子框空输入返回 DEFAULT_SEED，同语义两种输入各生一个世界。
+    if arg == "":
+        seed = config.DEFAULT_SEED
+    elif arg.isascii() and arg.isdigit():
+        seed = int(arg)
+    else:
+        import zlib
+        seed = zlib.crc32(arg.encode("utf-8")) & 0xFFFFFFFF
     if len(argv) > 1:
         raise ValueError(f"多余的参数: {' '.join(argv[1:])}"
                          "（载入存档请用 --load <路径>）")
@@ -561,8 +602,9 @@ def main():
             game = _create_new_game(seed)
 
     print("\n[提示] 游戏运行中。按 Esc 取消操作/关闭面板；关闭窗口请点右上角 X。")
-    print("[提示] V: 2D/3D | T: 科技面板(再按T关闭) | B: 加工 | X: 拆除 | R: 挖掘 | F: 放置方块")
-    print("[提示] C: 武器库 | P: 刷怪点波次面板 | F5: 快速存档 | F8: 存档管理")
+    print("[提示] V: 2D/3D | T: 科技面板(再按T关闭) | B: 加工 | X: 拆除 | R: 挖掘 | F: 放置方块 | K: 传送带")
+    print("[提示] H: 武器库 | P: 刷怪点波次面板 | Z/C: 相机上浮/下潜 | F5: 快速存档 | F8: 存档管理")
+    print("[提示] ;/,: 倍速档位(1x/1.5x/2x/3x/4x/6x/8x，顶栏可点) | F10: 设置（显示进攻路线/小地图/路线透明度，持久化）")
 
     _run_game_loop(game)
 

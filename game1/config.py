@@ -1,16 +1,19 @@
 """
 config.py - 全局常量与可调参数
 
-数值的“唯一事实来源”现在是 data/*.json（由 gamedata.py 在启动时读取）：
+数值的“唯一事实来源”现在是 data/*.json（共 9 个，由 gamedata.py 启动时读取）：
   - 科技树/科技效果   → data/tech.json
   - 配方/工具/武器/材料 → data/recipes.json
   - 敌人类型/掉落      → data/enemies.json
   - 刷怪点种类/侦察兵  → data/spawners.json
   - 波次构成          → data/waves.json
   - 塔属性           → data/towers.json
+  - 传送带类型        → data/belts.json
+  - 电线类型          → data/wires.json
+  - 电力（电站/电池/燃料）→ data/power.json
 
 本文件只保留纯工程/渲染常量（窗口、相机、物理、存档版本等）与无法归入
-上述六类的少量数值（初始金钱、升级倍率等）。
+上述九类的少量数值（初始金钱、升级倍率等）。
 """
 
 # ─── 日志 ──────────────────────────────────────────────────
@@ -25,6 +28,13 @@ WINDOW_TITLE = "Seeded Tower Defense"
 TARGET_FPS = 240
 FPS_UPDATE_INTERVAL = 0.25    # FPS 统计/刷新窗口（秒）
 
+# ─── 游戏倍速 ──────────────────────────────────────────────
+# 可切换的游戏速度倍率（低档细步进 ±0.5，高档翻倍；循环：8x → 下一档回 1x）。
+# 仅缩放游戏模拟（世界时间），不影响相机/UI（操作时间），见 game.Game.update。
+GAME_SPEEDS = (1.0, 1.5, 2.0, 3.0, 4.0, 6.0, 8.0)
+GAME_SPEED_KEY_UP = ";"      # 下一档
+GAME_SPEED_KEY_DOWN = ","    # 上一档
+
 # ─── 世界 ──────────────────────────────────────────────────
 WORLD_HEIGHT = 2048    # 地形最大高度（方块数）
 BLOCK_SIZE = 1.0       # 每个方块的世界单位大小
@@ -32,12 +42,12 @@ BLOCK_SIZE = 1.0       # 每个方块的世界单位大小
 # ─── 区块（无限地形） ────────────────────────────────────
 CHUNK_SIZE = 16               # 区块边长（方块数）
 RENDER_DISTANCE = 5           # 渲染距离（区块数，2D 模式用）
-# 3D 雾：以默认相机距离为基准（距离42下雾=50/110，保持原观感）；
+# 3D 雾：以默认相机距离为基准（距离42下雾=70/150，雾距拉远，视野更清晰）；
 # 拉远时雾远近随相机距离等比放大，但以 CAMERA_VIEW_DISTANCE_MAX 为上限。
 # CAMERA_VIEW_DISTANCE_MAX 同时封顶 3D 地形加载/剔除半径，避免拉远到 2000+ 时
 # 一次性生成上万区块网格卡死帧率（超界被满雾盖住，无露边）。
-FOG_NEAR = 50.0               # 基准雾起始距离（世界单位）
-FOG_FAR = 110.0               # 基准雾完全遮挡距离（世界单位）
+FOG_NEAR = 70.0               # 基准雾起始距离（世界单位）
+FOG_FAR = 150.0               # 基准雾完全遮挡距离（世界单位）
 CAMERA_DISTANCE_DEFAULT = 42.0  # 相机初始/参考距离，雾缩放基准
 CAMERA_VIEW_DISTANCE_MAX = 450.0  # 3D 地形加载/雾远上限（世界单位，防卡顿）
 FOG_DENSITY = 0.018           # 全局雾密度（备用）
@@ -149,16 +159,42 @@ NOISE_CFG = {
 # 存档文件格式版本。反序列化按此做迁移；未知字段一律 .get() 兜底。
 # v1→v2: 新增 per-spawner 运行时状态 + 侦察怪；旧全局波次映射到最近激活点。
 # v2→v3: 粗格编码 spawner id + enemy_paths dict by spawner_id。
-# v3→v4: 科技树 v2 数据（263 成果 + 770 突破点，5 时代），旧 12 科技 ID 别名映射。
+# v3→v4: 科技树 v2 数据（262 成果 + 776 突破点，5 时代——当前 tech.json 实测值，
+# 与 TECH_TREE.md 计数对齐，R8-R7），旧 12 科技 ID 别名映射。
 # v4→v5: 寻路系统——地形编辑覆盖层/变体路径/敌人攻击与挖掘状态/塔体 HP。
-SAVE_VERSION = 5
+# v5→v6: 加工塔——processing 存物/在制任务/手动配方字段（旧档缺字段宽松兜底为空）。
+# v6→v7: 传送带物流——belts 列表 + 仓储塔 belt_export 导出白名单（旧档缺省为空）。
+# v7→v8: 电力系统——wires 列表（CableSegment）+ 电力塔（电站/电池）燃料桶/电池储能字段。
+# v8→v9: 开采塔——mining 段（足迹/竖井前沿与进度）（旧档缺省回退默认）。
+# v9→v10: 按塔研究——研究塔 research 段（current/timer/total/queue 队列）；
+#         全局 tech.researching 迁入第一座研究塔，所有科技须在研究塔上研究。
+# v10→v11: 基地手研——station=false 科技无需研究塔，走基地 base_research 通道；
+#         旧档缺省为空（纯增量字段，无破坏性迁移）。
+SAVE_VERSION = 11
 
 # ─── 相机 ──────────────────────────────────────────────────
 CAMERA_DISTANCE_MIN = 5.0     # 拉近下限：贴近地面/海面
 CAMERA_DISTANCE_MAX = 2100.0  # 拉远上限：比 WORLD_HEIGHT=2048 略多，能框住最高地形
-CAMERA_ALTITUDE_MIN = -0.8    # 负值：相机可低于目标、斜向上看（≈ -46°）
+CAMERA_ALTITUDE_DEFAULT = 0.5   # 默认仰角（~29° 侧面视角，地形更立体）
+CAMERA_ALTITUDE_MIN = -1.55   # 负值：相机可低于目标、斜向上看（≈ -89°；与 MAX 对称）
 CAMERA_ALTITUDE_MAX = 1.55    # 接近正上方 (pi/2 ≈ 1.5708)
 CAMERA_TERRAIN_CLEARANCE = 0.2
+# 海平面与相机眼位下限：海洋柱水顶锚定恒定海平面 sea_top = int(0.005*height)
+# （=10，见 chunk._generate 的 BUG-007 恒定海平面），即当前世界唯一可定义的
+# "海平面"。相机下潜（仰角 <0，见 camera._clear_eye_y）时放开地形避让，
+# 眼位可降到基地地表之下俯瞰大本营平台，但不得低于海平面上方
+# （CAMERA_EYE_MIN_Y），避免穿进海底/基岩。
+# 缩放（滚轮）只改距离、不碰仰角/方位角：下潜与不下潜共用同一套相机行为，
+# 缩放绝不使视线方向旋转；进入/退出下潜一律用右键拖仰角（altitude<0）。
+SEA_LEVEL_Y = 10.0                      # 恒定海平面 = sea_top = int(0.005*WORLD_HEIGHT)
+CAMERA_EYE_MIN_Y = SEA_LEVEL_Y + 1.0   # 眼位硬下限（下潜时）＝ 海平面上方 1 格
+# 相机焦点垂直平移（Z=上浮 / C=下潜，3D 模式）：与 WASD 移 XZ 同一套"平移"
+# 语义，构成 Minecraft 式三维飞行——WASD 在水平面走到目标上方，再按 C 沉到
+# 海面/海底。焦点 Y 自由升降，只受绝对上下限约束，不按所在列地表钳制
+# （否则高地上按 C 会被顶回地表之上、下潜失效）；"不穿山体"由眼位避让
+# （camera._clear_eye_y）负责。
+CAMERA_TARGET_Y_MIN = 1.0
+CAMERA_TARGET_Y_MAX = 2048.0
 CAMERA_MOVE_SPEED = 15.0
 CAMERA_ROT_SPEED = 2.5
 CAMERA_ZOOM_SPEED = 0.002   # 3D 滚轮指数缩放系数：每格 ×exp(0.002*100)=×1.221
@@ -166,8 +202,9 @@ CAMERA_SPAWN_RAISE_MAX = 512.0   # 开局眼位相对基地地表的抬升上限
                                  # （500 种子实测最大需 ~343，此处留余量）
 CAMERA_SPAWN_KEEP = 1.0          # 眼位偏离开局位置 < 此值（格）时保持开局下限全额
 CAMERA_SPAWN_RELEASE = 8.0       # 偏离至 ≥ 此值（格）时开局下限完全淡出（线性）
-CAMERA_2D_ZOOM_MIN = 0.3
-CAMERA_2D_ZOOM_MAX = 3.0
+CAMERA_2D_ZOOM_MIN = 0.15
+CAMERA_2D_ZOOM_MAX = 24.0   # 拉近上限抬到一格 24px（原 3.0 一格仅 3px，
+                            # 2D 下看不清塔/放不准；拉远下限同步放宽以观全景）
 
 # ─── 实体（升级曲线等通用参数） ─────────────────────────────
 # 塔的基础属性见 data/towers.json；敌人基础属性见 data/enemies.json
@@ -176,6 +213,8 @@ TOWER_RANGE_MULT = 1.1       # 每级强化射程倍率增量（1.0=不生效）
 TOWER_COOLDOWN_MULT = 0.9    # 每级强化冷却倍率（越小越快）
 MAX_TOWER_LEVEL = 3
 UPGRADE_COST_MULT = 1.5      # 升级费用每级倍率
+RESEARCH_ATTR_PER_LEVEL = 2  # 研究塔每升 1 级增加的学识属性
+RESEARCH_QUEUE_MAX = 10      # 单座研究塔队列长度上限（防误点连锁扣钱）
 
 # 初始金钱与生命
 STARTING_MONEY = 200
@@ -185,18 +224,51 @@ STARTING_LIVES = 20
 PLAYER_DIG_COOLDOWN = 0.35   # 玩家连挖间隔（秒/格）
 MAX_BLOCK_STACK = 6          # 放置方块的高度上限（该列自然地表 + N 格）
 
+# ─── 传送带（物流） ────────────────────────────────────────
+# 塔↔传送带接口速率（件/秒/塔，所有相邻带共享一个塔的配额）：
+# 塔向传送带输出、传送带向塔输入都按此限速，防止一座塔瞬间清空/灌满。
+BELT_PORT_RATE = 2.0
+
+# ─── 电力（发电/输电/储能） ─────────────────────────────────
+# 电池充放电往返效率（0-1；充电时储能 ×eff，放电时交付 /eff 对应扣减）。
+POWER_BATTERY_EFF = 0.92
+# 电线电流超限跳闸后自动恢复时间（秒）；期间该段断路（暂态，不烧毁）。
+POWER_TRIP_TIME = 3.0
+
 # ─── 物理 ──────────────────────────────────────────────────
-PROJECTILE_SPEED = 15.0
+PROJECTILE_SPEED = 18.0
 PROJECTILE_LIFETIME = 3.0
-PROJECTILE_DRAG = 0.96       # 空气阻力系数（越小减速越快）
+# 空气阻力：每秒速度保留率（1=无阻力；实体代码按 `DRAG ** dt` 应用）。
+# R9-T2：旧的 0.96 配旧的 `**(dt*60)` 公式等效"0.96/帧@60fps"——每秒仅剩
+# 8.6% 速度，抛射体平地最大有效命中只有 ~5.4 格，而 towers/recipes 声明
+# 射程到 9.9（longbow Lv2）——远程塔对够不着的目标索敌开火、弹丸半路坠
+# 地持续空射，长射程优势大部作废。现改为每秒保留 0.94 + 初速提到 18，
+# 实测平地最大有效命中 ≈11.1~11.5 格，全部声明射程可达。
+PROJECTILE_DRAG = 0.94
 PROJECTILE_GRAVITY = -9.8    # 重力加速度（Y轴，负值向下）
 PROJECTILE_UPWARD_BIAS = 3.0 # 发射时额外向上补偿(抵消重力)
 PROJECTILE_HIT_RADIUS = 0.9  # 抛射体命中半径
+# 抛射体物理可达上限（格，平地）。由 SPEED=18 / DRAG=0.94/s / GRAVITY=-9.8
+# 实测最大有效命中 ≈11.1~11.5 格（数值探针见 check_projectile_timescale.py）。
+# Tower._find_target 以它为"弹丸可达"过滤上限（R9-T2）：声明射程与高度差
+# 加成之和不得超出物理可达，否则塔对够不着的目标开火 = 持续空射。
+PROJECTILE_REACH_CEILING = 10.5
 PROJECTILE_COLLISION_STEP = 0.25   # 抛射体飞行段碰撞采样步长（世界单位）；
                                    # 从上一帧位置到新位置按此步长线性插值采样
                                    # is_solid 查询，命中即停止，避免丢帧时一步跨过
                                    # 薄墙导致的"穿进又传出"。典型帧 2 次采样，
                                    # 丢帧峰值 ≤8 次，get_block_safe 为 dict 查表。
+PROJECTILE_PHYSICS_MAX_STEP = 1.0 / 60.0   # 抛射体物理单步时间上限（秒）：内部子步进。
+                                   # 游戏倍速（GAME_SPEEDS，最高 8x）整体缩放 sim_dt——
+                                   # 叠加 main.py 的 1/30 帧时间下限，单步 dt 可达
+                                   # 0.267 秒；重力/空气阻力按欧拉法单步积分的离散
+                                   # 误差随 dt 增大，高倍速下弹道整体下压变形——
+                                   # 1x 能命中的近距离弹也插进地里（"子弹打地"），
+                                   # 且大步长会穿过敌身漏判命中。Projectile.update
+                                   # 内部把 dt 拆成不超过此值的子步逐段积分，弹道/
+                                   # 命中判定与 1x 完全一致（倍速只影响每帧推进多远，
+                                   # 不再影响轨迹形状）。1x@240fps 时 dt=1/240 小于
+                                   # 此值 → n=1，行为逐位不变。
 
 # 塔射击的高度差加成（高打低优势）：
 # drop = 塔.y − 敌人.y，> 0 表示塔比敌人高（高地打低地）。
@@ -211,7 +283,16 @@ TOWER_ELEV_DMG_PER_BLOCK = 0.04   # 每下落 1 格，威力加成（乘性，1 
 # ─── 寻路（工程常量；类型偏好数值在 data/enemies.json） ──────
 PATH_ASTAR_NODE_BUDGET = 24000   # 单次 A* 展开节点上限（超限失败→放宽重试/兜底）
 PATH_CORRIDOR_MAX_HALF = 48      # 搜索走廊最大半宽（格，限制离直线的绕行范围）
-PATH_FALL_LIMIT = 4              # 下行高差硬上限（格，超过必须绕行——"高差大必绕行"）
+PATH_FALL_LIMIT = 4              # 下行高差软上限（格）：超过部分加"落地软代价"，
+                                 # 不再硬禁行——运行时 _sync_y 自由下坠无上限，深坑/
+                                 # 壕沟敌人跳得下去、也挖得上来；A* 若硬禁会误判不可达
+PATH_FALL_COST_PER_BLOCK = 0.05  # 超出 PATH_FALL_LIMIT 的每格额外下落时间代价（秒）
+                                 # （BUG-102 改版后 A* 下行按类型 fall_limit 硬禁行，
+                                 # 本常量保留仅供别处引用，寻路不再使用）
+# 敌人运行时下落重力（格/秒²，负值向下）：_sync_y 用它做抛物线下落，
+# 取代旧版固定 12 格/秒匀速"滑翔"。比 PROJECTILE_GRAVITY 更大，
+# 让敌人下落更干脆、不拖泥带水。
+GRAVITY = -24.0
 PATH_CLIMB_SOFT_COST = 0.30      # 每格爬升的额外时间代价（秒，×terrain_aware）
 PATH_TOWER_CELL_COST_MIN = 1.5   # 塔格代价下限（秒；实际≈拆塔时间×(1-tower_hostility)）
 PATH_WALL_CELL_COST = 1.0e9      # 防御塔(城墙)格代价：近乎不可通行，连续成墙即无法穿过
@@ -225,6 +306,36 @@ PATH_MIN_POINT_DIST = 0.35       # 平滑后路径点最小间距（世界单位
 PATH_REPATH_CHECK_INTERVAL = 2.0 # 敌人检查 world_version 是否过期的周期（秒）
 PATH_REPATH_BUDGET_PER_FRAME = 1 # 每帧重算 A* 的次数上限（摊帧防卡顿）
 PATH_SIEGE_DEFAULT_RANGE = 1.5   # 攻击塔近战判定距离（格）
+
+# ─── 大本营平台挖掘守卫（D2 修复：防止敌人把平台边缘挖成回不去的深坑）───
+# 平台 = 半径 BASE_RADIUS+3 的平整圆盘（见 chunk.base_center_height 的取样半径）。
+# 敌人可以在平台边缘"削台阶"爬上来，但若削得比平台低 2 格以上，回环需要爬
+# >climb_pass 且平台内 5×5 禁挖 → 永久卡死（实测 seed3091 `(-36,0) regular`
+# 停在 (-3,-1)、seed79 悬崖 tank 停在 (0,3)）。
+# 守卫语义：平台区内开挖产生的台阶高度 = 站位高度+1，最低不得低于 平台高度-1。
+#   等价条件：仅当 站位 >= 平台高度-2 时才允许在平台区开挖。
+# 玩家挖掘规则不受影响（dig_forbidden_at 仍只有 5×5 禁挖区）。
+BASE_DIG_GUARD_RADIUS = 6.0      # 守卫半径（= BASE_RADIUS + 3，与平台平整半径一致）
+BASE_DIG_GUARD_FLOOR = 1         # 平台区列顶最低 = 平台高度 - 本值
+
+# ─── 寻路走廊升级阶梯（D1b 修复：避免"地形有路但 A* 报无解"）───
+# 失败时按 (半宽, 节点预算) 对逐级放宽重试；实测 seed3091 有 23 个组合
+# （反向 BFS 穷举可达）因半宽 48 的走廊限制被判无解。各级预算为实测所需
+# （_probe_escalation_need.py）：half=160 需 9.6 万展开、224 需 15 万、
+# 360 需 36 万（一条横向偏差 298 格的绕行路线），此处已留余量。
+# 深层升级仅在该 (sid,类型,版本) 首次构建时发生一次，结果进缓存。
+PATH_CORRIDOR_ESCALATION = ((48, 48000), (96, 96000), (160, 150000),
+                            (224, 240000), (360, 400000))
+PATH_GRID_CACHE_MAX = 24         # 走廊网格缓存上限（放宽搜索后防内存膨胀）
+
+# ─── 敌人局部重规划（D3 修复：从"敌人当前格"而非"刷怪点"重新规划）───
+PATH_LOCAL_CORRIDOR_MAX = 64     # 局部走廊半宽基准上限（当前格→大本营）
+# 局部规划同样需要升级阶梯：实测 seed148 坑底基地的 tank 从 (54,20) 回基地
+# 需 half=160（绕坑壁 353 格），基础半宽 42/预算 4.8 万无解。
+PATH_LOCAL_ESCALATION = ((96, 96000), (160, 150000), (224, 240000))
+PATH_LOCAL_GRID_CACHE_MAX = 16   # 局部走廊网格缓存上限
+PATH_WAIT_STUCK_SECONDS = 20.0   # waiting_for_path 持续该时长触发看门狗重试
+PATH_WAIT_MAX_ATTEMPTS = 3       # 同一 world_version 内最多重试次数
 ENEMY_COLLIDE_RADIUS = 0.35      # 敌人间分离半径（世界单位）
 ENEMY_COLLIDE_STRENGTH = 6.0     # 分离推挤强度（重叠深度的倍率/秒）
 

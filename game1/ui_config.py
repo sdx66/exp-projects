@@ -37,6 +37,16 @@ HUD_MONEY_X = 395
 HUD_SCORE_X = 570
 HUD_FPS_X_OFFSET = 100  # 从右边偏移
 
+# 塔悬停识别标签（鼠标指向世界里的塔时显示名字/类型，不改塔外观）
+TOWER_HOVER_BG = (20, 20, 30, 215)
+TOWER_HOVER_BORDER = (140, 150, 180, 255)
+TOWER_HOVER_NAME = (235, 235, 250)
+TOWER_HOVER_DETAIL = (170, 180, 210)
+TOWER_HOVER_NAME_SIZE = 14
+TOWER_HOVER_DETAIL_SIZE = 12
+TOWER_HOVER_PAD = 6
+TOWER_HOVER_OFFSET = (16, 18)   # 标签相对光标的偏移
+
 # 材料栏（第 1 行：材料；第 2 行：武器 + 工具）
 HUD_MAT_X_START = 10
 HUD_MAT_Y = 44
@@ -45,44 +55,34 @@ HUD_MAT_Y2 = 60   # 第 2 行，避免与材料行重叠
 # 工具栏
 HUD_TOOL_X_OFFSET = 250  # 从右边偏移
 
+# HUD 研究通道逐条显示上限（超出折叠为“共 N 条”）
+HUD_RESEARCH_MAX_LINES = 6
+
+# 顶栏倍速分段控件（右对齐，位于 FPS 左侧）
+HUD_SPEED_Y = 12          # 顶栏内 y
+HUD_SPEED_H = 18          # 段高
+HUD_SPEED_PAD = 6         # 段内左右内边距
+HUD_SPEED_GAP = 3         # 段间距
+HUD_SPEED_RIGHT_OFFSET = 300  # 控件右缘距屏幕右缘（给 FPS 留位）
+HUD_SPEED_FONT = 12       # 段字号
+HUD_SPEED_TITLE_FONT = 12
+HUD_SPEED_TITLE_COLOR = (150, 150, 175)
+HUD_SPEED_BG = (48, 52, 68, 200)
+HUD_SPEED_SEL_BG = (72, 96, 130, 230)
+HUD_SPEED_SEL_BORDER = (255, 220, 100)
+HUD_SPEED_TEXT = (180, 180, 200)
+HUD_SPEED_SEL_TEXT = (255, 255, 255)
+
 # ─── 面板通用 ──────────────────────────────────────────────
 PANEL_BG_ALPHA = 0.7
 PANEL_OVERLAY_COLOR = (0, 0, 0)
 
-# ─── 科技面板 ──────────────────────────────────────────────
-TECH_PANEL_W = 680
-TECH_PANEL_H = 420
-TECH_PANEL_BG = (40, 45, 60)
-TECH_PANEL_BORDER = (100, 150, 200)
-TECH_PANEL_TITLE_COLOR = (220, 220, 240)
-TECH_PANEL_TITLE_SIZE = 24
-TECH_PANEL_FOOTER_SIZE = 12
-TECH_PANEL_FOOTER_COLOR = (150, 150, 175)
-TECH_PANEL_SECTION_SIZE = 14
-TECH_PANEL_ITEM_SIZE = 13
-TECH_PANEL_HEADER_SIZE = 14
-TECH_PANEL_HEADER_COLOR = (200, 200, 220)
-TECH_PANEL_UNLOCKED_COLOR = (180, 255, 180)
-TECH_PANEL_RESEARCHING_COLOR = (255, 200, 100)
-TECH_PANEL_DISABLED_COLOR = (90, 90, 110)
-TECH_PANEL_POOR_COLOR = (255, 120, 120)
-TECH_PANEL_AVAILABLE_COLOR = (255, 240, 160)
-TECH_PANEL_PROGRESS_BG = (60, 60, 75)
-TECH_PANEL_PROGRESS_FG = (255, 200, 100)
-
-# 科技说明已随科技数据移至 data/tech.json（gamedata.TECH_DESC）
-
-# ─── 科技树面板（新） ──────────────────────────────────────
+# ─── 科技树面板 ──────────────────────────────────────────────
+# （旧 TECH_PANEL_* 常量已随旧科技面板迁入 ui_tech_tree 一并删除，R4-K1）
 TECHTREE_PANEL_BG = (28, 32, 45, 230)
 TECHTREE_HEADER_H = 40
 TECHTREE_CONTENT_TOP = 68   # 内容区起始 y（表头 40 + 时代签行 24 + 余量 4）
 TECHTREE_CONTENT_BOTTOM = 30  # 内容区底部预留高度（与底栏一致）
-TECHTREE_NODE_W = 180
-TECHTREE_NODE_H = 36
-TECHTREE_ACHIEVEMENT_H = 44
-TECHTREE_COL_WIDTH = 220
-TECHTREE_ROW_HEIGHT = 52
-TECHTREE_TIER_GAP = 150   # 技术页纵轴行距（tier 行间距，根在底部）
 TECHTREE_LABEL_SIZE = 13
 TECHTREE_DESC_SIZE = 12
 TECHTREE_INFO_SIZE = 12
@@ -99,14 +99,11 @@ TECHTREE_NODE_RESEARCHING = (120, 90, 50)
 TECHTREE_NODE_UNLOCKED = (50, 120, 70)
 TECHTREE_NODE_SELECTED_BORDER = (255, 220, 100)
 TECHTREE_NODE_EDGES_COLOR = (80, 90, 110)
-TECHTREE_NODE_EDGES_UNLOCKS_COLOR = (120, 180, 120)
 
 # 成果节点颜色（3 态）
 TECHTREE_ACH_LOCKED = (55, 60, 75)
 TECHTREE_ACH_PARTIAL = (80, 70, 50)
 TECHTREE_ACH_UNLOCKED = (45, 110, 60)
-TECHTREE_ACH_PROGRESS_BG = (40, 45, 55)
-TECHTREE_ACH_PROGRESS_FG = (200, 180, 80)
 
 # 信息面板
 TECHTREE_INFO_BG = (35, 40, 55, 220)
@@ -117,13 +114,9 @@ TECHTREE_INFO_X = 12
 TECHTREE_INFO_Y = 52
 
 # 时代/分类标签
-TECHTREE_ERA_LABEL_SIZE = 16
-TECHTREE_ERA_LABEL_COLOR = (200, 200, 220)
 TECHTREE_CAT_LABEL_SIZE = 11
-TECHTREE_CAT_LABEL_BG = (50, 55, 70, 180)
 
 # 研究按钮
-TECHTREE_BTN_W = 120
 TECHTREE_BTN_H = 36
 TECHTREE_BTN_BG = (60, 120, 80)
 TECHTREE_BTN_HOVER = (80, 160, 100)
@@ -133,7 +126,19 @@ TECHTREE_BTN_TEXT = (240, 240, 240)
 # 底部提示
 TECHTREE_FOOTER_H = 30
 TECHTREE_FOOTER_SIZE = 11
-TECHTREE_FOOTER_COLOR = (150, 155, 175)
+
+# 研究通道条（多研究塔队列；底栏之上逐行展示每塔在研/排队状态）
+TECHTREE_LANE_H = 26               # 每行高
+TECHTREE_LANE_MAX_ROWS = 5         # 最多显示行数（多余折叠为 +N）
+TECHTREE_LANE_BG = (38, 42, 58, 225)
+TECHTREE_LANE_BG_SEL = (58, 66, 92, 235)
+TECHTREE_LANE_BORDER = (90, 110, 150)
+TECHTREE_LANE_TEXT = (200, 205, 225)
+TECHTREE_LANE_QLEN = (160, 200, 160)
+TECHTREE_LANE_BLOCKED = (235, 140, 120)
+TECHTREE_LANE_PROGRESS_BG = (45, 50, 65)
+TECHTREE_LANE_PROGRESS_FG = (120, 200, 255)
+TECHTREE_LANE_CANCEL = (155, 70, 70)
 
 # ─── 加工面板 ──────────────────────────────────────────────
 CRAFT_PANEL_W = 720
@@ -155,6 +160,56 @@ CRAFT_PANEL_TOOL_NEED_COLOR = (150, 120, 80)
 CRAFT_PANEL_DISABLED_COLOR = (90, 90, 110)
 CRAFT_PANEL_DIVIDER_COLOR = (55, 65, 85)
 
+# ─── 仓储面板 ──────────────────────────────────────────────
+STORAGE_PANEL_W = 640
+STORAGE_PANEL_H = 420
+STORAGE_PANEL_BG = (55, 48, 38)
+STORAGE_PANEL_BORDER = (190, 150, 95)
+STORAGE_PANEL_TITLE_COLOR = (235, 220, 190)
+STORAGE_PANEL_TITLE_SIZE = 24
+STORAGE_PANEL_HEADER_SIZE = 14
+STORAGE_PANEL_HEADER_COLOR = (220, 205, 175)
+STORAGE_PANEL_ITEM_SIZE = 13
+STORAGE_PANEL_FOOTER_SIZE = 12
+STORAGE_PANEL_FOOTER_COLOR = (150, 150, 175)
+STORAGE_PANEL_DIVIDER_COLOR = (90, 80, 60)
+STORAGE_ROW_BG = (70, 62, 48, 160)        # 可点击物品行底色
+STORAGE_PANEL_OK_COLOR = (180, 255, 180)       # 可操作行
+STORAGE_PANEL_NA_COLOR = (95, 95, 110)         # 不可操作行（背包无货/塔内无货）
+STORAGE_CAP_BG = (60, 60, 75)                  # 容量条
+STORAGE_CAP_FG_OK = (120, 220, 120)            # 容量条 <75%
+STORAGE_CAP_FG_WARN = (255, 200, 100)          # 75%~99%
+STORAGE_CAP_FG_FULL = (255, 120, 100)          # 已满
+
+# ─── 加工面板 ──────────────────────────────────────────────
+# 布局与仓储面板同构（_processing_rows 单一生成器供渲染/命中共用），
+# 多出工具架自动线与手动配方两段，故更高。
+PROCESSING_PANEL_W = 640
+PROCESSING_PANEL_H = 560
+PROCESSING_PANEL_BG = (52, 44, 40)
+PROCESSING_PANEL_BORDER = (205, 130, 70)
+PROCESSING_PANEL_TITLE_COLOR = (240, 215, 190)
+PROCESSING_PANEL_TITLE_SIZE = 24
+PROCESSING_PANEL_HEADER_SIZE = 14
+PROCESSING_PANEL_HEADER_COLOR = (225, 200, 175)
+PROCESSING_PANEL_ITEM_SIZE = 13
+PROCESSING_PANEL_FOOTER_SIZE = 12
+PROCESSING_PANEL_FOOTER_COLOR = (150, 150, 175)
+PROCESSING_PANEL_DIVIDER_COLOR = (95, 75, 60)
+PROCESSING_ROW_BG = (78, 64, 52, 160)        # 可点击行底色（物品/配方/工具）
+PROCESSING_ROW_BG_ACTIVE = (110, 82, 52, 220)  # 选中配方/在制任务行
+PROCESSING_PANEL_OK_COLOR = (190, 255, 190)  # 可操作行
+PROCESSING_PANEL_NA_COLOR = (100, 95, 110)   # 不可操作行（背包无货/塔内无货/科技未解锁）
+PROCESSING_CAP_BG = (60, 60, 75)             # 容量条
+PROCESSING_CAP_FG_OK = (120, 220, 120)       # 容量条 <75%
+PROCESSING_CAP_FG_WARN = (255, 200, 100)     # 75%~99%
+PROCESSING_CAP_FG_FULL = (255, 120, 100)     # 已满
+PROCESSING_PROGRESS_BG = (55, 55, 70)        # 在制进度条
+PROCESSING_PROGRESS_FG = (255, 190, 90)      # 在制进度条填充
+PROCESSING_STATUS_IDLE_COLOR = (150, 150, 175)   # 空闲/停机
+PROCESSING_STATUS_RUN_COLOR = (255, 210, 120)    # 加工中
+PROCESSING_STATUS_BLOCK_COLOR = (255, 130, 110)  # 缺原料/缺工具/空间不足
+
 # ─── 游戏结束 ──────────────────────────────────────────────
 GAMEOVER_ALPHA = 0.8
 GAMEOVER_TITLE_COLOR = (255, 80, 80)
@@ -173,8 +228,12 @@ WAVE_ANNOUNCE_TITLE_SIZE = 36
 WAVE_ANNOUNCE_DETAIL_SIZE = 16
 
 # ─── 放置预览 ──────────────────────────────────────────────
+# 幽灵立方体几何（塔类）取自 TowerType.body_dims，与实塔渲染共用一份来源；
+# CUBE_SIZE 仅用于武器塔幽灵与方块编辑预览。
 PLACE_PREVIEW_CUBE_SIZE = (0.6, 1.0, 0.6)
-PLACE_PREVIEW_WALL_CUBE_HEIGHT = 2.2   # 防御塔预览高度（与实际墙塔塔身一致）
+# 挖掘预览：略大于方块，保证高亮面从地形表面探出（方块嵌在实心体内时
+# 与方块同尺寸会被深度遮挡；侧脸/洞顶/洞底都能看到光标所在格）
+BLOCK_EDIT_PREVIEW_CUBE_SIZE = (1.04, 1.04, 1.04)
 PLACE_PREVIEW_VALID_COLOR = (100, 255, 100)
 PLACE_PREVIEW_INVALID_COLOR = (255, 100, 100)
 PLACE_PREVIEW_RANGE_COLOR = (100, 200, 100)
@@ -184,13 +243,18 @@ PLACE_PREVIEW_RANGE_ALPHA = 0.2
 
 # ─── 拆除高亮 ──────────────────────────────────────────────
 DISMANTLE_HIGHLIGHT_COLOR = (255, 60, 60, 80)
-DISMANTLE_HIGHLIGHT_SIZE = (0.7, 1.1, 0.7)
 
 # ─── 塔选择栏 ──────────────────────────────────────────────
 TOWER_BAR_KEYS = ["stone_thrower", "water_cannon", "sand_trap", "metal_tower",
-                  "palisade_wall", "city_wall", "star_fort"]
-TOWER_BAR_LABELS = ["Stone", "Water", "Sand", "Metal", "Wall", "City", "Fort"]
-TOWER_BAR_NUMS = ["1", "2", "3", "4", "9", "0", "点"]
+                  "palisade_wall", "city_wall", "star_fort", "storage_tower",
+                  "processing_tower", "research_tower", "mining_tower"]
+TOWER_BAR_LABELS = ["Stone", "Water", "Sand", "Metal", "Wall", "City", "Fort",
+                    "Store", "Proc", "Lab", "Mine"]
+# 热键须避开相机 WASD（W/A/S/D 移动、Q/E 偏航、Z/C 升降、V 2D/3D）：
+# 研究塔用 L（Lab）、开采塔用 N、仓储塔用 J（原 V 与相机 2D/3D 冲突，R6-003），
+# 星堡用 .（句点，原仅鼠标点选无热键，R9-004），电力模式用 Y（原 E 与相机
+# 左偏航冲突，R9-T1），均未与相机及其它 PLAYING 热键冲突。
+TOWER_BAR_NUMS = ["1", "2", "3", "4", "9", "0", ".", "J", "G", "L", "N"]
 # 塔栏分段按钮样式
 TOWER_BAR_SEG_BG = (48, 52, 68, 200)
 TOWER_BAR_SELECTED_BG = (72, 96, 130, 230)
@@ -217,11 +281,12 @@ MINIMAP_BASE_SIZE = 4
 MINIMAP_TOWER_SIZE = 2
 MINIMAP_ENEMY_SIZE = 2
 MINIMAP_SPAWNER_SIZE = 3
-MINIMAP_SPAWNER_DORMANT = (110, 110, 125, 190)    # 休眠点 1px 暗灰
 MINIMAP_EDGE_DOT_ACTIVE = (255, 95, 95, 230)      # 出界唤醒点：真方向边缘点
 MINIMAP_EDGE_DOT_SCOUTING = (255, 225, 95, 230)
 MINIMAP_ARROW_COLOR = (255, 235, 140, 235)        # 相机出界方向箭头 + 距离
-MINIMAP_PATH_COLOR = (255, 200, 50, 80)           # 烘焙路径叠加（仿 2D 路径色）
+# 路径叠加透明度（R1-A4：路径着色已移入 ui_minimap._overlay_paths，
+# 与 renderer._path_color_for 同为 tan×类型色 50% 混合；此处只留 alpha）
+MINIMAP_PATH_ALPHA = 80
 MINIMAP_CAMERA_COLOR = (255, 255, 255, 210)       # 2D 视野框
 MINIMAP_CAMERA_3D_COLOR = (130, 255, 130, 230)    # 3D target 十字/示意框
 MINIMAP_CONTOUR_STEP = 1 / 32    # 等高线间隔（归一化高度；×2048 = 64 方块一根）
@@ -238,3 +303,27 @@ MINIMAP_CONTOUR_LABEL_CAP_RANGE = (2, 20)  # 每条线标签数硬上限（保�
                                            # 正常密度由服务半径决定）
 MINIMAP_CONTOUR_LABEL_COLOR = (35, 25, 15, 255)   # 标签墨色（不透明）
 MINIMAP_CONTOUR_LABEL_HALO = 0.55   # 标签底向白混合比例（地形图留白）
+
+# ─── 设置面板（F10；持久化到 settings.json） ────────────────
+SETTINGS_PANEL_W = 520
+SETTINGS_PANEL_ROW_H = 46
+SETTINGS_PANEL_ROW_GAP = 8
+SETTINGS_PANEL_TITLE_SIZE = 24
+SETTINGS_PANEL_HEADER_SIZE = 14
+SETTINGS_PANEL_ITEM_SIZE = 15
+SETTINGS_PANEL_HINT_SIZE = 12
+SETTINGS_PANEL_FOOTER_SIZE = 12
+SETTINGS_PANEL_BG = (30, 34, 48)
+SETTINGS_PANEL_BORDER = (120, 150, 200)
+SETTINGS_PANEL_TITLE_COLOR = (220, 220, 240)
+SETTINGS_PANEL_SECTION_COLOR = (200, 200, 220)
+SETTINGS_PANEL_HINT_COLOR = (150, 155, 175)
+SETTINGS_PANEL_FOOTER_COLOR = (150, 150, 175)
+SETTINGS_PANEL_ROW_BG = (44, 50, 68)
+SETTINGS_PANEL_ROW_SELECTED_BG = (66, 80, 112)
+SETTINGS_PANEL_ROW_BORDER = (100, 150, 200)
+SETTINGS_PANEL_VALUE_ON = (120, 230, 140)     # 开启
+SETTINGS_PANEL_VALUE_OFF = (235, 120, 110)    # 关闭
+SETTINGS_PANEL_SLIDER_TRACK = (55, 60, 78)
+SETTINGS_PANEL_SLIDER_FILL = (120, 200, 255)
+SETTINGS_PANEL_SLIDER_KNOB = (240, 240, 255)
